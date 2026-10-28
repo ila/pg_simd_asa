@@ -1,0 +1,458 @@
+-- Automatic SIMD-ASA rewrite: metadata, mask derivation, aggregate replacement, rejections.
+LOAD 'simd_asa';
+SET extra_float_digits = 0;
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE r_customer (c_custkey integer, c_nation integer);
+CREATE TABLE r_orders (o_orderkey bigint, o_custkey integer, o_total integer);
+CREATE TABLE r_lineitem (l_orderkey bigint, l_qty integer, l_price float8, l_ship date);
+CREATE TABLE r_nation (n_key integer, n_name text);
+INSERT INTO r_customer SELECT c, c % 5 FROM generate_series(1, 200) c;
+INSERT INTO r_orders SELECT o, o % 200 + 1, o % 97 FROM generate_series(1, 1000) o;
+INSERT INTO r_lineitem SELECT l % 1000 + 1, l % 50 + 1, (l % 13) * 1.5, date '2026-01-01' + l % 300
+FROM generate_series(1, 4000) l;
+INSERT INTO r_nation SELECT n, 'nation ' || n FROM generate_series(0, 4) n;
+-- result equality of two tables (as multisets)
+CREATE FUNCTION pg_temp.same(a regclass, b regclass) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    r boolean;
+BEGIN
+    EXECUTE format('SELECT NOT EXISTS (SELECT * FROM %s EXCEPT ALL SELECT * FROM %s) AND '
+                   'NOT EXISTS (SELECT * FROM %s EXCEPT ALL SELECT * FROM %s)', a, b, b, a) INTO r;
+    RETURN r;
+END
+$$;
+-- ---------------------------------------------------------------------------
+-- Metadata
+-- ---------------------------------------------------------------------------
+SELECT asa_add_entity('r_customer', 'no_such_column');
+ERROR:  column "no_such_column" of relation r_customer does not exist
+CONTEXT:  PL/pgSQL function asa_check_key_column(regclass,name) line 8 at RAISE
+SQL statement "SELECT public.asa_check_key_column(tbl, key_column)"
+PL/pgSQL function asa_add_entity(regclass,name) line 3 at PERFORM
+SELECT asa_add_entity('r_nation', 'n_name');
+ERROR:  column r_nation.n_name has type text; sampling-entity keys and links must be smallint, integer or bigint
+CONTEXT:  PL/pgSQL function asa_check_key_column(regclass,name) line 11 at RAISE
+SQL statement "SELECT public.asa_check_key_column(tbl, key_column)"
+PL/pgSQL function asa_add_entity(regclass,name) line 3 at PERFORM
+SELECT asa_add_entity('r_customer', 'c_custkey');
+ asa_add_entity 
+----------------
+ 
+(1 row)
+
+SELECT asa_add_link('r_orders', 'o_custkey', 'r_customer', 'c_custkey');
+ asa_add_link 
+--------------
+ 
+(1 row)
+
+SELECT asa_add_link('r_lineitem', 'l_orderkey', 'r_orders', 'o_orderkey');
+ asa_add_link 
+--------------
+ 
+(1 row)
+
+SELECT relid, key_column FROM asa_entity;
+   relid    | key_column 
+------------+------------
+ r_customer | c_custkey
+(1 row)
+
+SELECT relid, link_column, ref_relid, ref_column FROM asa_link ORDER BY 1;
+   relid    | link_column | ref_relid  | ref_column 
+------------+-------------+------------+------------
+ r_orders   | o_custkey   | r_customer | c_custkey
+ r_lineitem | l_orderkey  | r_orders   | o_orderkey
+(2 rows)
+
+-- rewrite is opt-in
+SELECT pg_typeof(sum(o_total)) FROM r_orders;
+ pg_typeof 
+-----------
+ bigint
+(1 row)
+
+SET simd_asa.rewrite = on;
+SELECT c_nation, count(*), sum(c_custkey) FROM r_customer GROUP BY 1
+\gdesc
+  Column  |  Type   
+----------+---------
+ c_nation | integer
+ count    | real[]
+ sum      | real[]
+(3 rows)
+
+-- ---------------------------------------------------------------------------
+-- Entity key derivation (each rewritten query equals the hand-written as_* query)
+-- ---------------------------------------------------------------------------
+-- the entity itself
+CREATE TEMP TABLE rw AS SELECT c_nation, count(*) AS n, sum(c_custkey) AS s FROM r_customer GROUP BY 1;
+CREATE TEMP TABLE hw AS SELECT c_nation, as_count(priv_hash(asa_hash(c_custkey))) AS n,
+                               as_sum(priv_hash(asa_hash(c_custkey)), c_custkey) AS s FROM r_customer GROUP BY 1;
+SELECT pg_temp.same('rw', 'hw') AS entity_table;
+ entity_table 
+--------------
+ t
+(1 row)
+
+DROP TABLE rw, hw;
+-- a link to the entity: the link column is the entity key, no join
+EXPLAIN (COSTS OFF, VERBOSE) SELECT sum(o_total) FROM r_orders;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Aggregate
+   Output: as_sum(priv_hash(asa_hash(o_custkey)), o_total)
+   ->  Seq Scan on public.r_orders
+         Output: o_orderkey, o_custkey, o_total
+(4 rows)
+
+CREATE TEMP TABLE rw AS SELECT o_total % 3 AS g, sum(o_total) AS s, avg(o_total) AS a, min(o_total) AS mn,
+                               max(o_total) AS mx, count(o_total) AS n FROM r_orders GROUP BY 1;
+CREATE TEMP TABLE hw AS SELECT o_total % 3 AS g, as_sum(m, o_total) AS s, as_avg(m, o_total) AS a,
+                               as_min(m, o_total) AS mn, as_max(m, o_total) AS mx, as_count(m, o_total) AS n
+FROM (SELECT *, priv_hash(asa_hash(o_custkey)) AS m FROM r_orders) t GROUP BY 1;
+SELECT pg_temp.same('rw', 'hw') AS direct_link;
+ direct_link 
+-------------
+ t
+(1 row)
+
+DROP TABLE rw, hw;
+-- two links away: the linked relation is joined in
+EXPLAIN (COSTS OFF) SELECT sum(l_qty) FROM r_lineitem;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate
+   ->  Merge Join
+         Merge Cond: (asa_r_orders.o_orderkey = r_lineitem.l_orderkey)
+         ->  Sort
+               Sort Key: asa_r_orders.o_orderkey
+               ->  Seq Scan on r_orders asa_r_orders
+         ->  Sort
+               Sort Key: r_lineitem.l_orderkey
+               ->  Seq Scan on r_lineitem
+(9 rows)
+
+CREATE TEMP TABLE rw AS SELECT l_qty % 4 AS g, sum(l_qty) AS s, sum(l_price) AS p, count(*) AS n
+FROM r_lineitem WHERE l_ship < date '2026-08-01' GROUP BY 1;
+CREATE TEMP TABLE hw AS SELECT l_qty % 4 AS g, as_sum(m, l_qty) AS s, as_sum(m, l_price) AS p, as_count(m) AS n
+FROM (SELECT l.*, priv_hash(asa_hash(o.o_custkey)) AS m FROM r_lineitem l JOIN r_orders o ON l.l_orderkey = o.o_orderkey
+      WHERE l_ship < date '2026-08-01') t GROUP BY 1;
+SELECT pg_temp.same('rw', 'hw') AS injected_join;
+ injected_join 
+---------------
+ t
+(1 row)
+
+DROP TABLE rw, hw;
+-- an existing join along the link is reused (one join, one mask)
+EXPLAIN (COSTS OFF) SELECT sum(l_qty) FROM r_lineitem JOIN r_orders ON l_orderkey = o_orderkey;
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Aggregate
+   ->  Merge Join
+         Merge Cond: (r_orders.o_orderkey = r_lineitem.l_orderkey)
+         ->  Sort
+               Sort Key: r_orders.o_orderkey
+               ->  Seq Scan on r_orders
+         ->  Sort
+               Sort Key: r_lineitem.l_orderkey
+               ->  Seq Scan on r_lineitem
+(9 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT c_nation, sum(l_qty) FROM r_customer, r_orders, r_lineitem
+WHERE c_custkey = o_custkey AND o_orderkey = l_orderkey GROUP BY 1;
+                                             QUERY PLAN                                             
+----------------------------------------------------------------------------------------------------
+ HashAggregate
+   Output: r_customer.c_nation, as_sum(priv_hash(asa_hash(r_customer.c_custkey)), r_lineitem.l_qty)
+   Group Key: r_customer.c_nation
+   ->  Merge Join
+         Output: r_customer.c_nation, r_customer.c_custkey, r_lineitem.l_qty
+         Merge Cond: (r_lineitem.l_orderkey = r_orders.o_orderkey)
+         ->  Sort
+               Output: r_lineitem.l_qty, r_lineitem.l_orderkey
+               Sort Key: r_lineitem.l_orderkey
+               ->  Seq Scan on public.r_lineitem
+                     Output: r_lineitem.l_qty, r_lineitem.l_orderkey
+         ->  Sort
+               Output: r_customer.c_nation, r_customer.c_custkey, r_orders.o_orderkey
+               Sort Key: r_orders.o_orderkey
+               ->  Merge Join
+                     Output: r_customer.c_nation, r_customer.c_custkey, r_orders.o_orderkey
+                     Merge Cond: (r_orders.o_custkey = r_customer.c_custkey)
+                     ->  Sort
+                           Output: r_orders.o_custkey, r_orders.o_orderkey
+                           Sort Key: r_orders.o_custkey
+                           ->  Seq Scan on public.r_orders
+                                 Output: r_orders.o_custkey, r_orders.o_orderkey
+                     ->  Sort
+                           Output: r_customer.c_nation, r_customer.c_custkey
+                           Sort Key: r_customer.c_custkey
+                           ->  Seq Scan on public.r_customer
+                                 Output: r_customer.c_nation, r_customer.c_custkey
+(27 rows)
+
+CREATE TEMP TABLE rw AS SELECT n_name, sum(l_qty) AS s, count(*) AS n
+FROM r_customer JOIN r_orders ON c_custkey = o_custkey JOIN r_lineitem ON o_orderkey = l_orderkey
+     JOIN r_nation ON n_key = c_nation GROUP BY 1;
+CREATE TEMP TABLE hw AS SELECT n_name, as_sum(priv_hash(asa_hash(c_custkey)), l_qty) AS s,
+                               as_count(priv_hash(asa_hash(c_custkey))) AS n
+FROM r_customer JOIN r_orders ON c_custkey = o_custkey JOIN r_lineitem ON o_orderkey = l_orderkey
+     JOIN r_nation ON n_key = c_nation GROUP BY 1;
+SELECT pg_temp.same('rw', 'hw') AS reused_joins;
+ reused_joins 
+--------------
+ t
+(1 row)
+
+DROP TABLE rw, hw;
+-- tuples derived from two different entities belong to the worlds containing both
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT count(*) FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Aggregate
+   Output: as_count((priv_hash(asa_hash(a.o_custkey)) & priv_hash(asa_hash(b.o_custkey))))
+   ->  Merge Join
+         Output: a.o_custkey, b.o_custkey
+         Merge Cond: (a.o_total = b.o_total)
+         Join Filter: (a.o_orderkey < b.o_orderkey)
+         ->  Sort
+               Output: a.o_custkey, a.o_total, a.o_orderkey
+               Sort Key: a.o_total
+               ->  Seq Scan on public.r_orders a
+                     Output: a.o_custkey, a.o_total, a.o_orderkey
+         ->  Sort
+               Output: b.o_custkey, b.o_total, b.o_orderkey
+               Sort Key: b.o_total
+               ->  Seq Scan on public.r_orders b
+                     Output: b.o_custkey, b.o_total, b.o_orderkey
+(16 rows)
+
+CREATE TEMP TABLE rw AS SELECT count(*) AS n
+FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey;
+CREATE TEMP TABLE hw AS SELECT as_count(priv_hash(asa_hash(a.o_custkey)) & priv_hash(asa_hash(b.o_custkey))) AS n
+FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey;
+SELECT pg_temp.same('rw', 'hw') AS two_entities;
+ two_entities 
+--------------
+ t
+(1 row)
+
+DROP TABLE rw, hw;
+-- FILTER is kept; ORDER BY / DISTINCT on a rewritten column sort the arrays
+CREATE TEMP TABLE rw AS SELECT c_nation, count(*) FILTER (WHERE c_custkey > 100) AS n FROM r_customer GROUP BY 1;
+CREATE TEMP TABLE hw AS SELECT c_nation, as_count(priv_hash(asa_hash(c_custkey))) FILTER (WHERE c_custkey > 100) AS n
+FROM r_customer GROUP BY 1;
+SELECT pg_temp.same('rw', 'hw') AS filter_kept;
+ filter_kept 
+-------------
+ t
+(1 row)
+
+DROP TABLE rw, hw;
+CREATE TEMP TABLE rw AS SELECT c_nation, sum(c_custkey) AS s FROM r_customer GROUP BY 1 ORDER BY 2 DESC;
+SELECT c_nation FROM rw;
+ c_nation 
+----------
+        0
+        4
+        2
+        1
+        3
+(5 rows)
+
+SELECT c_nation FROM rw ORDER BY s DESC;
+ c_nation 
+----------
+        0
+        4
+        2
+        1
+        3
+(5 rows)
+
+DROP TABLE rw;
+CREATE TEMP TABLE rw AS SELECT DISTINCT count(*) AS n FROM r_customer GROUP BY c_nation;
+SELECT count(*) AS distinct_worlds FROM rw;
+ distinct_worlds 
+-----------------
+               5
+(1 row)
+
+DROP TABLE rw;
+-- prepared statements see the rewritten result type
+PREPARE p AS SELECT c_nation, count(*) FROM r_customer WHERE c_custkey > $1 GROUP BY 1;
+CREATE TEMP TABLE rw AS EXECUTE p(150);
+SELECT c_nation, pg_typeof(count), array_length(count, 1) FROM rw ORDER BY 1;
+ c_nation | pg_typeof | array_length 
+----------+-----------+--------------
+        0 | real[]    |           64
+        1 | real[]    |           64
+        2 | real[]    |           64
+        3 | real[]    |           64
+        4 | real[]    |           64
+(5 rows)
+
+DEALLOCATE p;
+DROP TABLE rw;
+-- not rewritten: sample-independent relations, non-aggregate queries, explicit as_* queries
+SELECT n_name, count(*) FROM r_nation GROUP BY 1 ORDER BY 1 LIMIT 2;
+  n_name  | count 
+----------+-------
+ nation 0 |     1
+ nation 1 |     1
+(2 rows)
+
+SELECT o_orderkey, o_total FROM r_orders ORDER BY 1 LIMIT 2;
+ o_orderkey | o_total 
+------------+---------
+          1 |       1
+          2 |       2
+(2 rows)
+
+SELECT array_length(as_count(priv_hash(asa_hash(c_custkey))), 1) FROM r_customer;
+ array_length 
+--------------
+           64
+(1 row)
+
+SELECT o_custkey FROM r_orders WHERE o_orderkey IN (SELECT l_orderkey FROM r_lineitem WHERE l_qty = 1) ORDER BY 1 LIMIT 2;
+ o_custkey 
+-----------
+         2
+         2
+(2 rows)
+
+-- ---------------------------------------------------------------------------
+-- Rejected query shapes
+-- ---------------------------------------------------------------------------
+SELECT c_nation FROM r_customer GROUP BY 1 HAVING sum(c_custkey) > 10;
+ERROR:  SIMD-ASA rewrite: aggregates in HAVING are not supported (a predicate over worlds)
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+SELECT 2 * sum(o_total) FROM r_orders;
+ERROR:  SIMD-ASA rewrite: expressions over aggregates are not supported (output column "?column?")
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+SELECT sum(o_total) / count(*) FROM r_orders;
+ERROR:  SIMD-ASA rewrite: expressions over aggregates are not supported (output column "?column?")
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+SELECT count(DISTINCT o_custkey) FROM r_orders;
+ERROR:  SIMD-ASA rewrite: count(DISTINCT ...) is not supported
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+SELECT min(l_ship) FROM r_lineitem;
+ERROR:  SIMD-ASA rewrite: min(date) is not supported (smallint, integer, bigint, real, double precision, numeric)
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+SELECT string_agg(n_name, ',') FROM r_customer JOIN r_nation ON n_key = c_nation;
+ERROR:  SIMD-ASA rewrite: aggregate string_agg(text,text) has no stochastic counterpart
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+SELECT max(s) FROM (SELECT o_custkey, sum(o_total) AS s FROM r_orders GROUP BY 1) t;
+ERROR:  SIMD-ASA rewrite: entity-dependent relations in subqueries, CTEs or views are not supported
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+WITH t AS (SELECT * FROM r_orders) SELECT count(*) FROM t;
+ERROR:  SIMD-ASA rewrite: entity-dependent relations in subqueries, CTEs or views are not supported
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+SELECT count(*) FROM r_nation WHERE n_key IN (SELECT c_nation FROM r_customer);
+ERROR:  SIMD-ASA rewrite: entity-dependent relations in subqueries, CTEs or views are not supported
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+SELECT count(*) FROM r_nation LEFT JOIN r_customer ON n_key = c_nation;
+ERROR:  SIMD-ASA rewrite: entity-dependent relation "r_customer" is on the nullable side of an outer join
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+SELECT c_nation, count(*), rank() OVER (ORDER BY c_nation) FROM r_customer GROUP BY 1;
+ERROR:  SIMD-ASA rewrite: window functions are not supported
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+SELECT c_nation, count(*) FROM r_customer GROUP BY ROLLUP (c_nation);
+ERROR:  SIMD-ASA rewrite: GROUPING SETS, ROLLUP and CUBE are not supported
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+CREATE VIEW r_orders_v AS SELECT * FROM r_orders;
+SELECT count(*) FROM r_orders_v;
+ERROR:  SIMD-ASA rewrite: entity-dependent relations in subqueries, CTEs or views are not supported
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+-- ---------------------------------------------------------------------------
+-- Several candidate sampling entities: each query selects one
+-- ---------------------------------------------------------------------------
+SELECT asa_add_entity('r_orders', 'o_orderkey');
+ asa_add_entity 
+----------------
+ 
+(1 row)
+
+SELECT count(*) FROM r_lineitem;
+ERROR:  SIMD-ASA: several sampling entities are declared
+HINT:  Choose one with SET simd_asa.entity = '<table>'.
+SET simd_asa.entity = 'r_nation';
+SELECT count(*) FROM r_lineitem;
+ERROR:  SIMD-ASA: simd_asa.entity "r_nation" is not a declared sampling entity
+HINT:  Declare it with asa_add_entity().
+SET simd_asa.entity = 'r_orders';
+EXPLAIN (COSTS OFF, VERBOSE) SELECT count(*) FROM r_lineitem;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Aggregate
+   Output: as_count(priv_hash(asa_hash(l_orderkey)))
+   ->  Seq Scan on public.r_lineitem
+         Output: l_orderkey, l_qty, l_price, l_ship
+(4 rows)
+
+SELECT pg_typeof(count(*)) FROM r_customer;
+ pg_typeof 
+-----------
+ bigint
+(1 row)
+
+SET simd_asa.entity = 'r_customer';
+EXPLAIN (COSTS OFF, VERBOSE) SELECT count(*) FROM r_lineitem;
+                                 QUERY PLAN                                  
+-----------------------------------------------------------------------------
+ Aggregate
+   Output: as_count(priv_hash(asa_hash(asa_r_orders.o_custkey)))
+   ->  Merge Join
+         Output: asa_r_orders.o_custkey
+         Merge Cond: (asa_r_orders.o_orderkey = r_lineitem.l_orderkey)
+         ->  Sort
+               Output: asa_r_orders.o_custkey, asa_r_orders.o_orderkey
+               Sort Key: asa_r_orders.o_orderkey
+               ->  Seq Scan on public.r_orders asa_r_orders
+                     Output: asa_r_orders.o_custkey, asa_r_orders.o_orderkey
+         ->  Sort
+               Output: r_lineitem.l_orderkey
+               Sort Key: r_lineitem.l_orderkey
+               ->  Seq Scan on public.r_lineitem
+                     Output: r_lineitem.l_orderkey
+(15 rows)
+
+RESET simd_asa.entity;
+SELECT asa_drop_entity('r_orders');
+ asa_drop_entity 
+-----------------
+ 
+(1 row)
+
+SELECT asa_drop_link('r_lineitem', 'r_orders');
+ asa_drop_link 
+---------------
+ 
+(1 row)
+
+SELECT pg_typeof(count(*)) FROM r_lineitem;
+ pg_typeof 
+-----------
+ bigint
+(1 row)
+
+RESET simd_asa.rewrite;
+DROP VIEW r_orders_v;
+SELECT asa_drop_link('r_orders', 'r_customer');
+ asa_drop_link 
+---------------
+ 
+(1 row)
+
+SELECT asa_drop_entity('r_customer');
+ asa_drop_entity 
+-----------------
+ 
+(1 row)
+
+DROP TABLE r_customer, r_orders, r_lineitem, r_nation;

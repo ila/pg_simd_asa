@@ -7,8 +7,9 @@ membership mask, bit *j* set means "this row belongs to world *j*", and the resu
 a `real[]` holding one answer per world. Scans, joins, filters and grouping are shared
 across the 64 worlds; only the world-specific aggregate state is widened.
 
-This is the engine layer only: no noise, no privacy mechanism, no query rewriter.
-Queries are written against the `as_*` aggregates directly (see [Design](#design)).
+No noise and no privacy mechanism: this is the stochastic-aggregation layer. Queries either
+use the `as_*` aggregates directly, or are ordinary SQL rewritten automatically from
+declared ownership metadata ([Automatic rewrite](#automatic-rewrite)).
 
 ## Functions
 
@@ -69,9 +70,63 @@ SELECT as_max(per_nation) FROM (
     FROM customer GROUP BY c_nationkey) t;
 ```
 
+## Automatic rewrite
+
+Declare the candidate sampling entities and the ownership links once. PostgreSQL extensions
+cannot add DDL syntax, so the DuckDB statements become function calls:
+
+| DuckDB | PostgreSQL |
+|---|---|
+| `ALTER TABLE customer ADD PRIVACY_KEY (c_custkey); ALTER TABLE customer SET PU;` | `SELECT asa_add_entity('customer', 'c_custkey');` |
+| `ALTER TABLE orders ADD PRIVACY_LINK (o_custkey) REFERENCES customer (c_custkey);` | `SELECT asa_add_link('orders', 'o_custkey', 'customer', 'c_custkey');` |
+
+(`asa_drop_entity`, `asa_drop_link`; the metadata lives in the tables `asa_entity` and
+`asa_link` and is included in `pg_dump`.) Links need not be enforced foreign keys. Then
+ordinary aggregate SQL returns one result per world:
+
+```sql
+SELECT asa_add_entity('customer', 'c_custkey');
+SELECT asa_add_link('orders', 'o_custkey', 'customer', 'c_custkey');
+SELECT asa_add_link('lineitem', 'l_orderkey', 'orders', 'o_orderkey');
+
+SET simd_asa.rewrite = on;
+SELECT l_returnflag, sum(l_quantity), avg(l_discount), count(*)   -- each column: real[64]
+FROM lineitem GROUP BY 1;
+```
+
+For each aggregate query over relations owned by the selected entity, the rewrite
+
+1. finds the entity-dependent relations in `FROM`: the entity and every relation with a
+   unique link path to it (the other relations, e.g. `nation`, are shared by all worlds);
+2. derives each one's entity key by following its links, through joins the query already
+   has (`l_orderkey = o_orderkey`), joining the linked relation in only when it is missing
+   (`lineitem` alone gets a join to `orders`), and with no join at all when the link points
+   at the entity (`o_custkey` is the customer key);
+3. computes the mask `priv_hash(asa_hash(key))`, AND-ing the masks of different entities
+   (a tuple joined from two customers belongs to the worlds containing both);
+4. replaces `sum`/`count`/`avg`/`min`/`max` by `as_sum`/`as_count`/`as_avg`/`as_min`/`as_max`.
+
+Several candidate entities can be declared; `SET simd_asa.entity = 'orders'` selects the one a
+query samples (with a single declared entity it is used by default). `EXPLAIN` shows the
+rewritten plan. Queries over sample-independent relations, queries without aggregates and
+queries that already use `as_*` aggregates are left unchanged.
+
+The rewrite runs at parse analysis (`post_parse_analyze_hook`), so the new result types are
+consistent for prepared statements and the extended protocol. Consequently the result arrays
+cannot be post-processed in the same statement (it was type-checked before the rewrite);
+store them with `CREATE TABLE AS` or write that query with `as_*` directly. Shapes whose world
+semantics are not implemented are rejected with an error rather than answered with ordinary
+one-world results: aggregates in `HAVING` or inside expressions (`sum(a) / sum(b)`),
+`DISTINCT` aggregates, entity-dependent relations in subqueries, CTEs or views, on the
+nullable side of an outer join, window functions and grouping sets.
+
+The hook must be loaded in the session (`LOAD 'simd_asa'`, or `session_preload_libraries` /
+`shared_preload_libraries`); the rewrite requires PostgreSQL ≥ 16.
+
 ## Build, install, test
 
-Requires PostgreSQL ≥ 14 development files (`pg_config`), a C compiler, little-endian CPU.
+Requires PostgreSQL ≥ 14 development files (`pg_config`) — ≥ 16 for the automatic
+rewrite — a C compiler, and a little-endian CPU.
 
 ```sh
 make && make install                 # PGXS; builds with -O3
@@ -81,7 +136,10 @@ make installcheck                    # pg_regress suite against a running server
 The regression suite (`test/sql`) checks every world of every aggregate and input type
 against the naive definition — 64 conditional `AGG(...) FILTER (WHERE bit j)` per group —
 plus DuckDB hash compatibility, NULL/empty/extreme inputs, counter re-aggregation and
-parallel (partial → serialize → combine) aggregation.
+parallel (partial → serialize → combine) aggregation. `test/sql/rewrite.sql` checks the
+automatic rewrite: every rewritten query must return exactly the hand-written `as_*` query's
+result (entity table, direct link, injected join, reused joins, two entities, `FILTER`,
+`ORDER BY`, prepared statements, entity selection), and every unsupported shape is rejected.
 
 `test/crosscheck_duckdb.sh` cross-validates against the DuckDB extension on generated
 data (2M rows × 100 groups × 64 worlds: identical masks; identical counts, min/max,
@@ -114,6 +172,23 @@ query; it scales with parallel workers like the ordinary aggregates. All SIMD-AS
 conditional ones (counts exact, sums ≤ 8.8·10⁻⁶ relative, averages ≤ 1.1·10⁻⁷). Part of the
 remaining overhead is the per-row `numeric` → `double` conversion of the inputs.
 
+`bench/tpch_rewrite.py` runs TPC-H Q1, Q3, Q5, Q6, Q10 and Q12 as ordinary SQL through the
+automatic rewrite (`CUSTOMER` as the entity, `ORDERS` and `LINEITEM` linked). Every rewritten
+query returns exactly the hand-written `as_*` query's result, and the rewrite adds no runtime
+(SF1, 4 workers, median of 3):
+
+| Query | 1 world (ms) | rewritten, 64 worlds (ms) | hand-written `as_*` (ms) |
+|---|---:|---:|---:|
+| Q1 | 876.8 | 2160.6 | 2147.5 |
+| Q3 | 270.4 | 274.7 | 273.9 |
+| Q5 | 273.5 | 272.4 | 273.1 |
+| Q6 | 184.8 | 241.1 | 240.8 |
+| Q10 | 391.6 | 392.7 | 394.0 |
+| Q12 | 266.7 | 266.3 | 267.3 |
+
+Q1 and Q6 read only `LINEITEM`, so the rewrite joins `ORDERS` in to reach the customer; the
+others already contain the joins and cost the same as the one-world query.
+
 ## Design
 
 The aggregate kernels are ported from the DuckDB extension, keeping their physical state
@@ -138,18 +213,18 @@ What changes for PostgreSQL is the integration, not the kernels:
   so the DuckDB buffering wrappers (which delay state allocation during vectorized
   scatter updates) are unnecessary and are not ported. The 64-world update itself is
   still a short, branch-free, auto-vectorized loop.
-- **Metadata and rewriting.** Ownership metadata (`PRIVACY_LINK`) and the automatic
-  query rewriter are not ported: masks are computed explicitly (`priv_hash(...)` on the
-  sampling entity's key, propagated through joins by joining to it). A rewriter would be a
-  `planner_hook` that adds the mask projection and replaces aggregates, as DuckDB's
-  optimizer extension does; enforced foreign keys are not required.
+- **Metadata and rewriting.** Ownership metadata is kept in extension tables instead of
+  DDL, and the rewrite is a parse-analysis hook instead of DuckDB's optimizer extension
+  (FK join injection + aggregate transformation, `src/asa_rewrite.c`). Enforced foreign
+  keys are not required. Not yet ported: the categorical rewrite of predicates over
+  worlds (`HAVING`, correlated subqueries such as Q17) and lane-wise expressions over
+  aggregates.
 
 Deviations from the DuckDB code:
 
-- Fixed: a world that only received negative integers is reported (the DuckDB counter
-  finalize takes the world mask from the positive state only and returns 0), and integer
-  magnitudes ≥ 2⁶³ (`INT64_MIN`) are routed by unsigned arithmetic (DuckDB routes them to
-  level 0 and loses them).
+- A world that only received negative integers is reported, and integer magnitudes
+  ≥ 2⁶³ (`INT64_MIN`) are routed by unsigned arithmetic. Both were bugs in the DuckDB code,
+  fixed there in [cwida/privacy#29](https://github.com/cwida/privacy/pull/29).
 - `numeric` uses the floating-point path (DuckDB `DECIMAL` uses the integer path).
 - PAC/DP-specific parts are omitted: noise terminals (`as_noised_*`), the `correction`
   argument, the sample-diversity guard, clipping (`as_clip_*`) and sample-and-aggregate

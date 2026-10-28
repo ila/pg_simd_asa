@@ -64,6 +64,9 @@ asa_agg_context(FunctionCallInfo fcinfo, const char *fname)
 	return aggctx;
 }
 
+/* Defines the rewrite settings and installs the parse-analysis hook (asa_rewrite.c). */
+extern void asa_rewrite_init(void);
+
 /* Builds a 64-element real[] without NULLs. */
 extern ArrayType *asa_make_array(const asa_float *vals);
 

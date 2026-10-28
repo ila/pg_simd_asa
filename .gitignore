@@ -6,3 +6,4 @@ test/results/
 test/regression.*
 log/
 results/
+simd_asa--0.2.sql
