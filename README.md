@@ -102,14 +102,15 @@ against the conditional ones.
 TPC-H SF1 (6M line items, `numeric(15,2)` columns as in the standard schema), PostgreSQL
 16.15, Apple M1, JIT off, median of 3 runs after a warm-up:
 
-| Variant | Worlds | Aggregates | Serial |
-|---|---:|---:|---:|
-| Q1 | 1 | 8 | 3.58 s |
-| Q1, SIMD-ASA | 64 | 8 | 6.08 s |
-| Q1, conditional SQL | 64 | 512 | 131.5 s |
+| Variant | Worlds | Aggregates | Serial | 4 workers |
+|---|---:|---:|---:|---:|
+| Q1 | 1 | 8 | 3.58 s | 0.92 s |
+| Q1, SIMD-ASA | 64 | 8 | 6.08 s | 1.52 s |
+| Q1, conditional SQL | 64 | 512 | 131.5 s | 32.4 s |
 
-SIMD-ASA computes the 64 worlds 21.7× faster than the single-scan conditional-SQL
-formulation and at 1.7× the cost of the single-world query. All SIMD-ASA worlds match the
+SIMD-ASA computes the 64 worlds 21× faster than the single-scan conditional-SQL
+formulation (21.7× serial, 21.3× parallel) and at 1.7× the cost of the single-world
+query; it scales with parallel workers like the ordinary aggregates. All SIMD-ASA worlds match the
 conditional ones (counts exact, sums ≤ 8.8·10⁻⁶ relative, averages ≤ 1.1·10⁻⁷). Part of the
 remaining overhead is the per-row `numeric` → `double` conversion of the inputs.
 
