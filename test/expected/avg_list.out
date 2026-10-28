@@ -1,0 +1,59 @@
+SET extra_float_digits = 0;
+CREATE TABLE at AS
+SELECT k % 10 AS g, k % 3 AS h, priv_hash(asa_hash(k::bigint)) AS m,
+       CASE WHEN k % 11 = 0 THEN NULL ELSE (k % 1000 - 300) END AS vi, ((k % 997) / 3.0 - 100)::float8 AS vd
+FROM generate_series(1, 30000) k;
+-- as_avg: lane j = sum_j / count_j, NULL for empty worlds
+SELECT (as_avg(m, v))[1:4] FROM (VALUES (1::bigint, 10), (2, -7), (3, 5), (3, NULL)) t(m, v);
+       as_avg       
+--------------------
+ {7.5,-1,NULL,NULL}
+(1 row)
+
+-- as_avg equals priv_div(as_sum, as_count) and the naive conditional AVG
+WITH a AS (SELECT g, as_avg(m, vi) a_i, priv_div(as_sum(m, vi), as_count(m, vi)) d_i, as_avg(m, vd) a_d FROM at GROUP BY g),
+     n AS (SELECT g, j, avg(vi) FILTER (WHERE (m >> j) & 1 = 1) e_i, avg(vd) FILTER (WHERE (m >> j) & 1 = 1) e_d
+           FROM at, generate_series(0, 63) j GROUP BY g, j)
+SELECT count(*) AS cells, count(*) FILTER (WHERE a_i[j + 1] IS DISTINCT FROM d_i[j + 1]) AS avg_vs_div_mismatch,
+       max(abs(a_i[j + 1] - e_i) / greatest(abs(e_i), 1)) < 1e-6 AS integer_ok,
+       max(abs(a_d[j + 1] - e_d) / greatest(abs(e_d), 1)) < 1e-4 AS float8_ok
+FROM a JOIN n USING (g);
+ cells | avg_vs_div_mismatch | integer_ok | float8_ok 
+-------+---------------------+------------+-----------
+   640 |                   0 | t          | t
+(1 row)
+
+-- priv_div: NULL where either input is NULL or the denominator is 0
+SELECT priv_div(ARRAY[1, 2, 3, 4]::real[], ARRAY[2, 0, NULL, 8]::real[]);
+      priv_div       
+---------------------
+ {0.5,NULL,NULL,0.5}
+(1 row)
+
+-- re-aggregation of counter arrays: inner per-(g,h) worlds, outer per-g worlds
+WITH inner_q AS (SELECT g, h, as_sum(m, vi) s, as_count(m) c, as_min(m, vi) mn, as_max(m, vi) mx
+                 FROM at GROUP BY g, h),
+     outer_q AS (SELECT g, as_sum(s) s, as_sum(c) c, as_min(mn) mn, as_max(mx) mx, as_count(s) n FROM inner_q GROUP BY g),
+     direct AS (SELECT g, as_sum(m, vi) s, as_count(m) c, as_min(m, vi) mn, as_max(m, vi) mx FROM at GROUP BY g)
+SELECT count(*) AS groups, bool_and(o.s = d.s AND o.c = d.c AND o.mn = d.mn AND o.mx = d.mx) AS reaggregation_ok,
+       bool_and(o.n = array_fill(3::real, ARRAY[64])) AS count_ok
+FROM outer_q o JOIN direct d USING (g);
+ groups | reaggregation_ok | count_ok 
+--------+------------------+----------
+     10 | t                | t
+(1 row)
+
+-- NULL elements are skipped; a world that never saw a value is NULL
+SELECT (as_sum(c))[1:4], (as_count(c))[1:4], (as_min(c))[1:4], (as_max(c))[1:4]
+FROM (VALUES (ARRAY[1, 2, NULL]::real[]), (ARRAY[10, NULL, NULL]::real[])) t(c);
+      as_sum      |    as_count     |     as_min      |      as_max      
+------------------+-----------------+-----------------+------------------
+ {11,2,NULL,NULL} | {2,1,NULL,NULL} | {1,2,NULL,NULL} | {10,2,NULL,NULL}
+(1 row)
+
+SELECT as_sum(c) IS NULL FROM (VALUES (NULL::real[])) t(c);
+ ?column? 
+----------
+ t
+(1 row)
+

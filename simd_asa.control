@@ -1,0 +1,5 @@
+# simd_asa extension
+comment = 'SIMD-accelerated stochastic aggregation: 64 world-specific aggregates per call'
+default_version = '0.1'
+module_pathname = '$libdir/simd_asa'
+relocatable = true
