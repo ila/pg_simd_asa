@@ -14,13 +14,19 @@
  *   3. mask = AND over the distinct keys of priv_hash(asa_hash(key)): a joined tuple
  *      belongs to world j iff every entity it derives from does.
  *   4. Replace sum/count/avg/min/max(x) by as_sum/as_count/as_avg/as_min/as_max(mask, x),
- *      which return one result per world (real[64]).
+ *      which return one result per world (real[64]); + - * / over aggregates are evaluated
+ *      per world (asa_lane_*).
+ *   5. A WHERE comparison with a scalar sub-select that aggregates over entity-dependent
+ *      relations (TPC-H Q17) is a predicate over worlds: the sub-select is rewritten the
+ *      same way, and the comparison becomes the mask of the worlds where it holds, AND-ed
+ *      into the outer mask instead of filtering rows.
  *
  * Rewriting at parse analysis (post_parse_analyze_hook) rather than in the planner keeps
  * the changed result types consistent for prepared statements and the extended protocol.
- * Query shapes whose world semantics the rewrite does not implement (aggregates in HAVING
- * or inside expressions, aggregation in subqueries, dependent relations on the nullable
- * side of outer joins, ...) are rejected rather than silently left unrewritten.
+ * Query shapes whose world semantics the rewrite does not implement (aggregates in HAVING,
+ * other expressions over aggregates, other subqueries over dependent relations, dependent
+ * relations on the nullable side of outer joins, ...) are rejected rather than silently
+ * left unrewritten.
  */
 #include "postgres.h"
 
@@ -666,32 +672,219 @@ asa_uses_extension_aggregates(Query *query, Oid schema)
 		asa_extension_aggref_walker(query->havingQual, &schema);
 }
 
-static void
-asa_rewrite_query(ParseState *pstate, Query *query)
+/* Converts expr to double precision for broadcasting to every world. */
+static Node *
+asa_to_float8(AsaCtx *ctx, Node *expr)
 {
-	AsaMeta    *meta;
+	Node	   *out = coerce_to_target_type(ctx->pstate, expr, exprType(expr), FLOAT8OID, -1, COERCION_EXPLICIT,
+											COERCE_IMPLICIT_CAST, -1);
+
+	if (!out)
+		ASA_UNSUPPORTED("cannot combine a value of type %s with per-world results",
+						format_type_be(exprType(expr)));
+	return out;
+}
+
+/* Calls a lane-wise function (asa_lanes.c) on real[] / double precision arguments. */
+static Expr *
+asa_lane_call(AsaCtx *ctx, const char *name, List *args, Oid rettype)
+{
+	Oid			argtypes[2];
+	ListCell   *lc;
+	int			n = 0;
+
+	foreach(lc, args)
+		argtypes[n++] = exprType((Node *) lfirst(lc));
+	return (Expr *) makeFuncExpr(asa_func(ctx, name, n, argtypes), rettype, args, InvalidOid, InvalidOid,
+								 COERCE_EXPLICIT_CALL);
+}
+
+/*
+ * Rewrites an expression over aggregates into its per-world evaluation: aggregates become
+ * as_* aggregates (real[64]), + - * / become lane-wise operations, other operands are
+ * broadcast, and casts are dropped (worlds are real). *lanes tells whether the result is
+ * per-world.
+ */
+static Node *
+asa_lanewise(AsaCtx *ctx, Node *node, Expr *mask, bool *lanes)
+{
+	*lanes = false;
+	if (node == NULL || !contain_agg_clause(node))
+		return node;
+	*lanes = true;
+	if (IsA(node, Aggref))
+		return (Node *) asa_rewrite_aggref(ctx, (Aggref *) node, mask);
+	if (IsA(node, RelabelType))
+		return asa_lanewise(ctx, (Node *) ((RelabelType *) node)->arg, mask, lanes);
+	if (IsA(node, FuncExpr) &&
+		(((FuncExpr *) node)->funcformat == COERCE_IMPLICIT_CAST ||
+		 ((FuncExpr *) node)->funcformat == COERCE_EXPLICIT_CAST))
+		return asa_lanewise(ctx, linitial(((FuncExpr *) node)->args), mask, lanes);
+	if (IsA(node, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) node;
+		char	   *opname = get_opname(op->opno);
+		int			nargs = list_length(op->args);
+		const char *fn = NULL;
+		List	   *args = NIL;
+		ListCell   *lc;
+
+		if (nargs == 2 && strcmp(opname, "+") == 0)
+			fn = "asa_lane_add";
+		else if (nargs == 2 && strcmp(opname, "-") == 0)
+			fn = "asa_lane_sub";
+		else if (nargs == 2 && strcmp(opname, "*") == 0)
+			fn = "asa_lane_mul";
+		else if (nargs == 2 && strcmp(opname, "/") == 0)
+			fn = "asa_lane_div";
+		else if (nargs == 1 && strcmp(opname, "-") == 0)
+			fn = "asa_lane_neg";
+		if (fn)
+		{
+			foreach(lc, op->args)
+			{
+				bool		arg_lanes;
+				Node	   *arg = asa_lanewise(ctx, lfirst(lc), mask, &arg_lanes);
+
+				args = lappend(args, arg_lanes ? arg : asa_to_float8(ctx, arg));
+			}
+			return (Node *) asa_lane_call(ctx, fn, args, FLOAT4ARRAYOID);
+		}
+	}
+	ASA_UNSUPPORTED("this expression over aggregates cannot be evaluated per world (supported: + - * / and casts)");
+	return NULL;				/* keep compiler quiet */
+}
+
+static bool asa_rewrite_level(ParseState *pstate, Query *query, AsaMeta *meta);
+
+static bool
+asa_uses_dependent(AsaMeta *meta, Query *query)
+{
+	AsaNestedCtx nested = {0};
+
+	nested.meta = meta;
+	asa_nested_query(query, &nested);	/* counts the relations of query itself */
+	return nested.nested;
+}
+
+/*
+ * A WHERE conjunct "x op (SELECT <aggregates over entity-dependent relations> ...)" is a
+ * predicate over worlds: the sub-select yields one value per world, so whether a row passes
+ * depends on the world (TPC-H Q17: l_quantity < (SELECT 0.2 * avg(l_quantity) ...)). The
+ * sub-select is rewritten itself, and the conjunct becomes the mask of the worlds in which
+ * it holds, to be AND-ed into the membership mask of the outer aggregates. Returns NULL if
+ * the conjunct is an ordinary predicate.
+ */
+static Expr *
+asa_world_predicate(AsaCtx *ctx, Node *conjunct)
+{
+	static const char *const ops[][2] = {
+		{"<", "asa_lane_lt"}, {"<=", "asa_lane_le"}, {">", "asa_lane_gt"},
+		{">=", "asa_lane_ge"}, {"=", "asa_lane_eq"}, {"<>", "asa_lane_ne"}};
+	OpExpr	   *op = (OpExpr *) conjunct;
+	const char *fn = NULL;
+	char	   *opname;
+	List	   *args = NIL;
+	int			sublinks = 0;
+	ListCell   *lc;
+
+	if (!IsA(conjunct, OpExpr) || list_length(op->args) != 2)
+		return NULL;
+	opname = get_opname(op->opno);
+	for (int i = 0; i < lengthof(ops); i++)
+		if (strcmp(opname, ops[i][0]) == 0)
+			fn = ops[i][1];
+	if (!fn)
+		return NULL;
+	foreach(lc, op->args)
+	{
+		Node	   *arg = lfirst(lc);
+
+		while (IsA(arg, RelabelType))
+			arg = (Node *) ((RelabelType *) arg)->arg;
+		if (IsA(arg, SubLink) && ((SubLink *) arg)->subLinkType == EXPR_SUBLINK &&
+			((Query *) ((SubLink *) arg)->subselect)->hasAggs &&
+			asa_uses_dependent(ctx->meta, (Query *) ((SubLink *) arg)->subselect))
+		{
+			SubLink    *sublink = (SubLink *) arg;
+			Query	   *sub = (Query *) sublink->subselect;
+			ParseState *sub_pstate = make_parsestate(NULL);
+
+			/* the sub-select gets its own parse state: injected joins go into its range table */
+			sub_pstate->p_sourcetext = ctx->pstate->p_sourcetext;
+			sub_pstate->p_rtable = sub->rtable;
+			sub_pstate->p_rteperminfos = sub->rteperminfos;
+			if (!asa_rewrite_level(sub_pstate, sub, ctx->meta))
+				return NULL;
+			sublinks++;
+			args = lappend(args, sublink);	/* now of type real[] */
+		}
+		else
+			args = lappend(args, arg);
+	}
+	if (sublinks == 0)
+		return NULL;
+	foreach(lc, args)
+		if (exprType((Node *) lfirst(lc)) != FLOAT4ARRAYOID)
+		{
+			if (contain_agg_clause(lfirst(lc)))
+				return NULL;
+			lfirst(lc) = asa_to_float8(ctx, lfirst(lc));
+		}
+	return asa_lane_call(ctx, fn, args, INT8OID);
+}
+
+static Expr *
+asa_and_masks(AsaCtx *ctx, Expr *a, Expr *b)
+{
+	if (!a)
+		return b;
+	return (Expr *) make_op(ctx->pstate, list_make2(makeString("pg_catalog"), makeString("&")), (Node *) a,
+							(Node *) b, NULL, -1);
+}
+
+/*
+ * Rewrites one aggregating query level (the statement, or a world-predicate sub-select).
+ * Returns false when the level aggregates only over sample-independent relations.
+ */
+static bool
+asa_rewrite_level(ParseState *pstate, Query *query, AsaMeta *meta)
+{
 	AsaNestedCtx nested = {0};
 	AsaCtx		ctx = {0};
 	List	   *direct = NIL;
 	List	   *keys = NIL;
+	List	   *predicates = NIL;
 	Expr	   *mask = NULL;
 	Bitmapset  *rewritten = NULL;
 	ListCell   *lc;
 	int			rtindex;
-	bool		has_nested = false;
 
-	/* a query without aggregates matters only if a sub-query (or view) might aggregate */
-	foreach(lc, query->rtable)
+	/* Vars are marked for column privileges through pstate, which must describe this query */
+	if (pstate->p_rtable != query->rtable)
+		ASA_UNSUPPORTED("unexpected parse state for this statement");
+	ctx.pstate = pstate;
+	ctx.query = query;
+	ctx.meta = meta;
+
+	/* predicates over worlds leave WHERE and become part of the mask */
+	if (query->jointree->quals)
 	{
-		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+		List	   *keep = NIL;
 
-		has_nested |= rte->rtekind == RTE_SUBQUERY || (rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_VIEW);
+		foreach(lc, make_ands_implicit((Expr *) query->jointree->quals))
+		{
+			Expr	   *predicate = asa_world_predicate(&ctx, lfirst(lc));
+
+			if (predicate)
+				predicates = lappend(predicates, predicate);
+			else
+				keep = lappend(keep, lfirst(lc));
+		}
+		query->jointree->quals = (Node *) make_ands_explicit(keep);
+		if (keep == NIL)
+			query->jointree->quals = NULL;
 	}
-	if (!query->hasAggs && !has_nested && !query->hasSubLinks && query->cteList == NIL)
-		return;
-	meta = asa_load_meta();
-	if (!meta || asa_uses_extension_aggregates(query, meta->schema))
-		return;
 
 	nested.meta = meta;
 	query_tree_walker(query, asa_nested_walker, &nested, QTW_EXAMINE_RTES_BEFORE);
@@ -704,16 +897,11 @@ asa_rewrite_query(ParseState *pstate, Query *query)
 		if (rte->rtekind == RTE_RELATION && rte->relkind != RELKIND_VIEW && asa_is_dependent(meta, rte->relid))
 			direct = lappend_int(direct, rtindex);
 	}
-	if (!query->hasAggs)
-	{
-		if (nested.nested_agg)
-			ASA_UNSUPPORTED("aggregation over entity-dependent relations in a subquery or view is not supported");
-		return;
-	}
 	if (nested.nested)
-		ASA_UNSUPPORTED("entity-dependent relations in subqueries, CTEs or views are not supported");
-	if (direct == NIL)
-		return;					/* aggregates over sample-independent relations only */
+		ASA_UNSUPPORTED("entity-dependent relations in subqueries, CTEs or views are not supported "
+						"(except in a comparison with a scalar sub-select in WHERE)");
+	if (direct == NIL && predicates == NIL)
+		return false;			/* aggregates over sample-independent relations only */
 	if (query->hasWindowFuncs)
 		ASA_UNSUPPORTED("window functions are not supported");
 	if (query->groupingSets)
@@ -723,12 +911,6 @@ asa_rewrite_query(ParseState *pstate, Query *query)
 	if (contain_agg_clause(query->havingQual))
 		ASA_UNSUPPORTED("aggregates in HAVING are not supported (a predicate over worlds)");
 
-	/* Vars are marked for column privileges through pstate, which must describe this query */
-	if (pstate->p_rtable != query->rtable)
-		ASA_UNSUPPORTED("unexpected parse state for this statement");
-	ctx.pstate = pstate;
-	ctx.query = query;
-	ctx.meta = meta;
 	asa_mark_nullable((Node *) query->jointree, false, &ctx.nullable);
 	asa_collect_eqs((Node *) query->jointree, false, &ctx.eqs);
 	ctx.max_rtindex = list_length(query->rtable) + ASA_MAX_INJECTED_JOINS;
@@ -750,27 +932,53 @@ asa_rewrite_query(ParseState *pstate, Query *query)
 			keys = lappend(keys, key);
 	}
 	foreach(lc, keys)
-	{
-		Expr	   *key_mask = asa_key_mask(&ctx, (Expr *) lfirst(lc));
-
-		mask = mask ? (Expr *) make_op(pstate, list_make2(makeString("pg_catalog"), makeString("&")),
-									   (Node *) mask, (Node *) key_mask, NULL, -1) : key_mask;
-	}
+		mask = asa_and_masks(&ctx, mask, asa_key_mask(&ctx, (Expr *) lfirst(lc)));
+	foreach(lc, predicates)
+		mask = asa_and_masks(&ctx, mask, (Expr *) lfirst(lc));
 
 	foreach(lc, query->targetList)
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		bool		lanes;
 
-		if (!contain_agg_clause((Node *) tle->expr))
-			continue;
-		if (!IsA(tle->expr, Aggref))
-			ASA_UNSUPPORTED("expressions over aggregates are not supported (output column \"%s\")",
-							tle->resname ? tle->resname : "?");
-		tle->expr = (Expr *) asa_rewrite_aggref(&ctx, (Aggref *) tle->expr, mask);
-		rewritten = bms_add_member(rewritten, tle->resno);
+		tle->expr = (Expr *) asa_lanewise(&ctx, (Node *) tle->expr, mask, &lanes);
+		if (lanes)
+			rewritten = bms_add_member(rewritten, tle->resno);
 	}
 	asa_fix_sortgroup(query->sortClause, query->targetList, rewritten);
 	asa_fix_sortgroup(query->distinctClause, query->targetList, rewritten);
+	return true;
+}
+
+static void
+asa_rewrite_query(ParseState *pstate, Query *query)
+{
+	AsaMeta    *meta;
+	AsaNestedCtx nested = {0};
+	ListCell   *lc;
+	bool		has_nested = false;
+
+	/* a query without aggregates matters only if a sub-query (or view) might aggregate */
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		has_nested |= rte->rtekind == RTE_SUBQUERY || (rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_VIEW);
+	}
+	if (!query->hasAggs && !has_nested && !query->hasSubLinks && query->cteList == NIL)
+		return;
+	meta = asa_load_meta();
+	if (!meta || asa_uses_extension_aggregates(query, meta->schema))
+		return;
+	if (!query->hasAggs)
+	{
+		nested.meta = meta;
+		query_tree_walker(query, asa_nested_walker, &nested, QTW_EXAMINE_RTES_BEFORE);
+		if (nested.nested_agg)
+			ASA_UNSUPPORTED("aggregation over entity-dependent relations in a subquery or view is not supported");
+		return;
+	}
+	asa_rewrite_level(pstate, query, meta);
 }
 
 /* ---------------------------------------------------------------------------

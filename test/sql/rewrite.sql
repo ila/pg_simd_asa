@@ -111,6 +111,50 @@ CREATE TEMP TABLE rw AS SELECT DISTINCT count(*) AS n FROM r_customer GROUP BY c
 SELECT count(*) AS distinct_worlds FROM rw;
 DROP TABLE rw;
 
+-- ---------------------------------------------------------------------------
+-- Expressions over aggregates are evaluated per world (TPC-H Q14 shape)
+-- ---------------------------------------------------------------------------
+SELECT asa_lane_add(ARRAY[1, 2, NULL]::real[], ARRAY[10, 20, 30]::real[]) AS add,
+       asa_lane_sub(ARRAY[5, 5, 5]::real[], 1) AS sub, asa_lane_mul(2, ARRAY[1, 2, 3]::real[]) AS mul,
+       asa_lane_div(ARRAY[1, 2, 3]::real[], ARRAY[2, 0, 1]::real[]) AS div, asa_lane_neg(ARRAY[1, -2]::real[]) AS neg;
+SELECT asa_lane_lt(ARRAY[1, 5, 3, NULL]::real[], 4) AS lt, asa_lane_ge(4, ARRAY[1, 5, 3]::real[]) AS ge,
+       asa_lane_eq(ARRAY[1, 2, 3]::real[], ARRAY[1, 0, 3]::real[]) AS eq;
+EXPLAIN (COSTS OFF, VERBOSE) SELECT 100.0 * sum(c_custkey) / count(*) FROM r_customer;
+CREATE TEMP TABLE rw AS SELECT c_nation, 100.0 * sum(c_custkey) / count(*) AS r, -sum(c_custkey) + c_nation AS n,
+                               sum(c_custkey)::numeric(12, 2) AS c FROM r_customer GROUP BY 1;
+CREATE TEMP TABLE hw AS SELECT c_nation, asa_lane_div(asa_lane_mul(100.0, as_sum(m, c_custkey)), as_count(m)) AS r,
+                               asa_lane_add(asa_lane_neg(as_sum(m, c_custkey)), c_nation) AS n, as_sum(m, c_custkey) AS c
+FROM (SELECT *, priv_hash(asa_hash(c_custkey)) AS m FROM r_customer) t GROUP BY 1;
+SELECT pg_temp.same('rw', 'hw') AS lane_expressions;
+DROP TABLE rw, hw;
+
+-- ---------------------------------------------------------------------------
+-- A comparison with an aggregating sub-select is a predicate over worlds (TPC-H Q17 shape):
+-- the sub-select yields one value per world, and the comparison's per-world outcome is
+-- folded into the mask of the outer aggregates.
+-- ---------------------------------------------------------------------------
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT sum(l_price) FROM r_lineitem l1
+WHERE l_qty < (SELECT avg(l_qty) FROM r_lineitem l2 WHERE l2.l_orderkey % 10 = l1.l_orderkey % 10);
+CREATE TEMP TABLE rw AS SELECT sum(l_price) AS s FROM r_lineitem l1
+WHERE l_qty < (SELECT avg(l_qty) FROM r_lineitem l2 WHERE l2.l_orderkey % 10 = l1.l_orderkey % 10);
+-- the definition: the query evaluated on each world alone (as_sum reports 2 x sum)
+SET simd_asa.rewrite = off;
+CREATE TEMP TABLE def AS
+WITH li AS (SELECT l.*, priv_hash(asa_hash(o_custkey)) AS m FROM r_lineitem l JOIN r_orders ON l_orderkey = o_orderkey),
+     w AS (SELECT j, li.* FROM li, generate_series(0, 63) j WHERE (m >> j) & 1 = 1),
+     a AS (SELECT j, l_orderkey % 10 AS g, avg(l_qty) AS avg_qty FROM w GROUP BY 1, 2)
+SELECT w.j, 2 * sum(l_price) AS s FROM w JOIN a ON a.j = w.j AND a.g = w.l_orderkey % 10
+WHERE l_qty < avg_qty GROUP BY w.j;
+SELECT count(*) AS worlds, count(*) FILTER (WHERE abs(r.v - d.s) > 1e-4 * abs(d.s)) AS worlds_differing
+FROM (SELECT ordinality - 1 AS j, v FROM rw, unnest(rw.s) WITH ORDINALITY u(v, ordinality)) r JOIN def d USING (j);
+DROP TABLE rw, def;
+SET simd_asa.rewrite = on;
+-- outer rows that are shared by all worlds: the predicate alone decides the worlds
+EXPLAIN (COSTS OFF, VERBOSE) SELECT count(*) FROM r_nation WHERE n_key < (SELECT avg(c_nation) FROM r_customer);
+-- a sub-select over sample-independent relations stays an ordinary predicate
+EXPLAIN (COSTS OFF) SELECT count(*) FROM r_customer WHERE c_nation < (SELECT max(n_key) FROM r_nation);
+
 -- prepared statements see the rewritten result type
 PREPARE p AS SELECT c_nation, count(*) FROM r_customer WHERE c_custkey > $1 GROUP BY 1;
 CREATE TEMP TABLE rw AS EXECUTE p(150);
@@ -128,8 +172,8 @@ SELECT o_custkey FROM r_orders WHERE o_orderkey IN (SELECT l_orderkey FROM r_lin
 -- Rejected query shapes
 -- ---------------------------------------------------------------------------
 SELECT c_nation FROM r_customer GROUP BY 1 HAVING sum(c_custkey) > 10;
-SELECT 2 * sum(o_total) FROM r_orders;
-SELECT sum(o_total) / count(*) FROM r_orders;
+SELECT sum(o_total) > 10 FROM r_orders;
+SELECT round(sum(o_total)) FROM r_orders;
 SELECT count(DISTINCT o_custkey) FROM r_orders;
 SELECT min(l_ship) FROM r_lineitem;
 SELECT string_agg(n_name, ',') FROM r_customer JOIN r_nation ON n_key = c_nation;

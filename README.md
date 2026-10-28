@@ -22,6 +22,8 @@ declared ownership metadata ([Automatic rewrite](#automatic-rewrite)).
 | `as_min(mask bigint, value)` / `as_max(...)` | `real[64]` | extreme per world; same types |
 | `as_sum / as_count / as_min / as_max(counters real[])` | `real[64]` | re-aggregate counter arrays (nested aggregation) |
 | `priv_div(real[], real[])` | `real[]` | element-wise division, NULL where the denominator is 0 or NULL |
+| `asa_lane_add/sub/mul/div(a, b)`, `asa_lane_neg(a)` | `real[]` | per-world arithmetic; `a`, `b`: `real[]` or `double precision` (broadcast); `/ 0` is NULL |
+| `asa_lane_lt/le/gt/ge/eq/ne(a, b)` | `bigint` | mask of the worlds where the comparison holds |
 | `priv_hash(key_hash bigint)` | `bigint` | membership mask of a sampling entity |
 | `asa_hash(bigint)`, `asa_hash(integer)` | `bigint` | DuckDB's `hash()` on integers |
 
@@ -104,7 +106,15 @@ For each aggregate query over relations owned by the selected entity, the rewrit
    at the entity (`o_custkey` is the customer key);
 3. computes the mask `priv_hash(asa_hash(key))`, AND-ing the masks of different entities
    (a tuple joined from two customers belongs to the worlds containing both);
-4. replaces `sum`/`count`/`avg`/`min`/`max` by `as_sum`/`as_count`/`as_avg`/`as_min`/`as_max`.
+4. replaces `sum`/`count`/`avg`/`min`/`max` by `as_sum`/`as_count`/`as_avg`/`as_min`/`as_max`,
+   and evaluates `+ - * /` over aggregates per world (`asa_lane_*`; TPC-H Q14's
+   `100 * sum(promo) / sum(revenue)`);
+5. turns a `WHERE` comparison with a scalar sub-select that aggregates over entity-dependent
+   relations into a predicate over worlds (TPC-H Q17's
+   `l_quantity < (SELECT 0.2 * avg(l_quantity) ... WHERE l_partkey = p_partkey)`): the
+   sub-select is rewritten the same way and yields one value per world, and instead of
+   filtering rows, the comparison's per-world outcome (`asa_lane_lt`) is AND-ed into the outer
+   mask — a row then counts in world *j* only if it belongs to *j* and passes there.
 
 Several candidate entities can be declared; `SET simd_asa.entity = 'orders'` selects the one a
 query samples (with a single declared entity it is used by default). `EXPLAIN` shows the
@@ -116,9 +126,12 @@ consistent for prepared statements and the extended protocol. Consequently the r
 cannot be post-processed in the same statement (it was type-checked before the rewrite);
 store them with `CREATE TABLE AS` or write that query with `as_*` directly. Shapes whose world
 semantics are not implemented are rejected with an error rather than answered with ordinary
-one-world results: aggregates in `HAVING` or inside expressions (`sum(a) / sum(b)`),
-`DISTINCT` aggregates, entity-dependent relations in subqueries, CTEs or views, on the
-nullable side of an outer join, window functions and grouping sets.
+one-world results: aggregates in `HAVING`, expressions over aggregates other than arithmetic
+and casts (comparisons, function calls), `DISTINCT` aggregates, entity-dependent relations in
+subqueries, CTEs or views other than the scalar sub-select comparison above (e.g. `IN`,
+`EXISTS`, derived tables), on the nullable side of an outer join, window functions and
+grouping sets. Arithmetic is evaluated in floating point per world (integer division does
+not truncate).
 
 The hook must be loaded in the session (`LOAD 'simd_asa'`, or `session_preload_libraries` /
 `shared_preload_libraries`); the rewrite requires PostgreSQL ≥ 16.
@@ -172,22 +185,29 @@ query; it scales with parallel workers like the ordinary aggregates. All SIMD-AS
 conditional ones (counts exact, sums ≤ 8.8·10⁻⁶ relative, averages ≤ 1.1·10⁻⁷). Part of the
 remaining overhead is the per-row `numeric` → `double` conversion of the inputs.
 
-`bench/tpch_rewrite.py` runs TPC-H Q1, Q3, Q5, Q6, Q10 and Q12 as ordinary SQL through the
-automatic rewrite (`CUSTOMER` as the entity, `ORDERS` and `LINEITEM` linked). Every rewritten
-query returns exactly the hand-written `as_*` query's result, and the rewrite adds no runtime
-(SF1, 4 workers, median of 3):
+`bench/tpch_rewrite.py` runs TPC-H Q1, Q3, Q5, Q6, Q10, Q12, Q14 and Q17 as ordinary SQL
+through the automatic rewrite (`CUSTOMER` as the entity, `ORDERS` and `LINEITEM` linked).
+Every rewritten query returns exactly the hand-written `as_*` query's result. Q14 and Q17 are
+also checked against their definition — the original query evaluated separately on each of
+the 64 worlds (for Q17 including the per-world correlated `AVG`): all 64 worlds agree within
+float rounding (max relative difference 6.3·10⁻⁶ and 6.6·10⁻⁷). The rewrite adds no runtime
+(SF1, 4 workers, median of 3, index on `lineitem(l_partkey)`):
 
 | Query | 1 world (ms) | rewritten, 64 worlds (ms) | hand-written `as_*` (ms) |
 |---|---:|---:|---:|
-| Q1 | 876.8 | 2160.6 | 2147.5 |
-| Q3 | 270.4 | 274.7 | 273.9 |
-| Q5 | 273.5 | 272.4 | 273.1 |
-| Q6 | 184.8 | 241.1 | 240.8 |
-| Q10 | 391.6 | 392.7 | 394.0 |
-| Q12 | 266.7 | 266.3 | 267.3 |
+| Q1 | 899.0 | 2383.8 | 2275.0 |
+| Q3 | 276.9 | 299.1 | 302.6 |
+| Q5 | 291.6 | 285.9 | 287.4 |
+| Q6 | 191.0 | 256.3 | 264.6 |
+| Q10 | 405.3 | 406.0 | 401.2 |
+| Q12 | 276.3 | 275.4 | 277.7 |
+| Q14 | 225.0 | 291.7 | 289.8 |
+| Q17 | 613.6 | 229.3 | 229.2 |
 
-Q1 and Q6 read only `LINEITEM`, so the rewrite joins `ORDERS` in to reach the customer; the
-others already contain the joins and cost the same as the one-world query.
+Q1, Q6 and Q14 read `LINEITEM` without `ORDERS`, so the rewrite joins `ORDERS` in to reach
+the customer; the others already contain the joins and cost about the same as the one-world
+query. (Rewritten Q17 is faster than the one-world query only because PostgreSQL picks a
+different plan once the correlated sub-select moves from `WHERE` into the aggregate.)
 
 ## Design
 
@@ -215,10 +235,11 @@ What changes for PostgreSQL is the integration, not the kernels:
   still a short, branch-free, auto-vectorized loop.
 - **Metadata and rewriting.** Ownership metadata is kept in extension tables instead of
   DDL, and the rewrite is a parse-analysis hook instead of DuckDB's optimizer extension
-  (FK join injection + aggregate transformation, `src/asa_rewrite.c`). Enforced foreign
-  keys are not required. Not yet ported: the categorical rewrite of predicates over
-  worlds (`HAVING`, correlated subqueries such as Q17) and lane-wise expressions over
-  aggregates.
+  (FK join injection, aggregate transformation, and the categorical rewrite of
+  expressions and predicates over worlds — DuckDB's `list_transform` lambdas become
+  `asa_lane_*` calls; `src/asa_rewrite.c`). Enforced foreign keys are not required. Not yet
+  ported: predicates over worlds in `HAVING` (world-specific group existence) and
+  sub-selects other than a scalar comparison in `WHERE`.
 
 Deviations from the DuckDB code:
 

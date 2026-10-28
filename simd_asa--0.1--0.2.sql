@@ -77,3 +77,29 @@ LANGUAGE sql AS $$ DELETE FROM @extschema@.asa_entity WHERE relid = tbl $$;
 
 CREATE FUNCTION @extschema@.asa_drop_link(tbl regclass, ref_tbl regclass) RETURNS void
 LANGUAGE sql AS $$ DELETE FROM @extschema@.asa_link WHERE relid = tbl AND ref_relid = ref_tbl $$;
+
+-- ---------------------------------------------------------------------------
+-- Per-world (lane-wise) arithmetic and comparisons on counter arrays; a double precision
+-- argument is broadcast to every world. Comparisons return the mask of the worlds where
+-- they hold. The rewrite uses them for expressions over aggregates and predicates over
+-- worlds; they can also be used directly.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+    fn text;
+    sig text;
+BEGIN
+    FOREACH fn IN ARRAY ARRAY['add', 'sub', 'mul', 'div', 'lt', 'le', 'gt', 'ge', 'eq', 'ne']
+    LOOP
+        FOREACH sig IN ARRAY ARRAY['real[], real[]', 'real[], double precision', 'double precision, real[]']
+        LOOP
+            EXECUTE format('CREATE FUNCTION @extschema@.asa_lane_%s(%s) RETURNS %s AS %L, %L '
+                           'LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE',
+                           fn, sig, CASE WHEN fn IN ('add', 'sub', 'mul', 'div') THEN 'real[]' ELSE 'bigint' END,
+                           'MODULE_PATHNAME', 'asa_lane_' || fn);
+        END LOOP;
+    END LOOP;
+END
+$$;
+CREATE FUNCTION @extschema@.asa_lane_neg(real[]) RETURNS real[]
+AS 'MODULE_PATHNAME', 'asa_lane_neg' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
