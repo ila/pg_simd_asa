@@ -2,7 +2,7 @@
 """TPC-H through the automatic SIMD-ASA rewrite (CUSTOMER as the sampling entity).
 
 For each query: the rewritten query (ordinary SQL, simd_asa.rewrite = on) must return exactly
-the result of the hand-written as_* query (checked single-threaded), and both are timed against
+the result of the hand-written as_* query (checked single-threaded, simd_asa.counters = on), and both are timed against
 the ordinary one-world query. Q14 (expressions over aggregates) and Q17 (correlated AVG as a
 predicate over worlds) are additionally checked against their definition: the original query
 evaluated separately in each of the 64 worlds.
@@ -135,7 +135,8 @@ def exec_ms(sql, settings):
 
 
 psql(SETUP)
-ON, OFF = "SET simd_asa.rewrite = on;", "SET simd_asa.rewrite = off;"
+# per-world counters (simd_asa.counters), as the hand-written as_* queries return
+ON, OFF = "SET simd_asa.rewrite = on; SET simd_asa.counters = on;", "SET simd_asa.rewrite = off;"
 print("validation (single-threaded): rewritten query == hand-written as_* query")
 for name, sql, hand in QUERIES:
     res = psql(f"""SET max_parallel_workers_per_gather = 0;

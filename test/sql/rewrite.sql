@@ -1,5 +1,8 @@
 -- Automatic SIMD-ASA rewrite: metadata, mask derivation, aggregate replacement, rejections.
 LOAD 'simd_asa';
+-- These tests check the per-world counters (as before 0.2's noised releases); release.sql
+-- tests the default noised releases.
+SET simd_asa.counters = on;
 SET extra_float_digits = 0;
 SET max_parallel_workers_per_gather = 0;
 
