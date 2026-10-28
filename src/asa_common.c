@@ -37,6 +37,7 @@ _PG_init(void)
 							 "Repair priv_hash() masks to exactly 32 set bits.",
 							 "Every sampling entity then belongs to exactly half of the 64 worlds.",
 							 &asa_hash_repair, false, PGC_USERSET, 0, NULL, NULL, NULL);
+	asa_rewrite_init();			/* defines simd_asa.rewrite / simd_asa.entity: before reserving */
 #if PG_VERSION_NUM >= 150000
 	MarkGUCPrefixReserved("simd_asa");
 #else
