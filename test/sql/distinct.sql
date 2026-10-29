@@ -1,0 +1,132 @@
+-- count/sum/avg(DISTINCT value): a distinct value is in the worlds of any row carrying it
+-- (the OR of their masks, DuckDB's bit_or pre-aggregation).
+LOAD 'simd_asa';
+SET extra_float_digits = 0;
+SET max_parallel_workers_per_gather = 0;
+SET simd_asa.noise = off;
+SET simd_asa.sample_diversity_check = off;
+
+-- 400 entities; values shared across entities, some NULL
+CREATE TABLE dt (k integer, g integer, vi integer, vb bigint, vf float8, vn numeric(8,2), vt text);
+INSERT INTO dt SELECT x % 400, x % 3, NULLIF(x % 37, 5), x % 53, (x % 29) * 0.5, (x % 31) * 1.25, 't' || x % 41
+FROM generate_series(1, 4000) x;
+CREATE TEMP VIEW d AS SELECT *, priv_hash(asa_hash(k)) AS m, asa_query_hash() AS q FROM dt;
+
+-- the definition: in world j, the aggregate over the distinct values of the rows in world j
+CREATE TEMP TABLE def AS
+SELECT g, j, 2 * count(DISTINCT vi) AS ci, 2 * count(DISTINCT vt) AS ct, 2 * sum(DISTINCT vi) AS si,
+       2 * sum(DISTINCT vb) AS sb, 2 * sum(DISTINCT vf) AS sf, 2 * sum(DISTINCT vn) AS sn, avg(DISTINCT vi) AS ai,
+       avg(DISTINCT vf) AS af
+FROM d, generate_series(0, 63) j WHERE (m >> j) & 1 = 1 GROUP BY g, j;
+CREATE TEMP TABLE lanes AS
+SELECT g, asa_counters_count_distinct(m, vi, q, 1 ORDER BY vi) AS ci,
+       asa_counters_count_distinct(m, vt, q, 1 ORDER BY vt) AS ct,
+       asa_counters_sum_distinct(m, vi, q, 1 ORDER BY vi) AS si,
+       asa_counters_sum_distinct(m, vb, q, 1 ORDER BY vb) AS sb,
+       asa_counters_sum_distinct(m, vf, q, 1 ORDER BY vf) AS sf,
+       asa_counters_sum_distinct(m, vn, q, 1 ORDER BY vn) AS sn,
+       asa_counters_avg_distinct(m, vi, q, 1 ORDER BY vi) AS ai,
+       asa_counters_avg_distinct(m, vf, q, 1 ORDER BY vf DESC) AS af
+FROM d GROUP BY g;
+SELECT count(*) AS cells,
+       count(*) FILTER (WHERE l.ci[j + 1] <> def.ci) AS count_int,
+       count(*) FILTER (WHERE l.ct[j + 1] <> def.ct) AS count_text,
+       count(*) FILTER (WHERE l.si[j + 1] <> def.si) AS sum_int,
+       count(*) FILTER (WHERE l.sb[j + 1] <> def.sb) AS sum_bigint,
+       count(*) FILTER (WHERE abs(l.sf[j + 1] - def.sf) > 1e-4 * def.sf) AS sum_float,
+       count(*) FILTER (WHERE abs(l.sn[j + 1] - def.sn) > 1e-4 * def.sn) AS sum_numeric,
+       count(*) FILTER (WHERE abs(l.ai[j + 1] - def.ai) > 1e-5 * def.ai) AS avg_int,
+       count(*) FILTER (WHERE abs(l.af[j + 1] - def.af) > 1e-5 * def.af) AS avg_float
+FROM lanes l JOIN def USING (g);
+DROP TABLE def, lanes;
+
+-- groups of one distinct value (fed to the base aggregate by the final function): the
+-- value is in the worlds of the OR of the group's masks
+SELECT count(*) AS groups, count(*) FILTER (WHERE c <> d) AS count_differing,
+       count(*) FILTER (WHERE s <> asa_lane_mul(d, vb::float8)) AS sum_differing
+FROM (SELECT vb, asa_counters_count_distinct(m, vb, q, 1 ORDER BY vb) AS c,
+             asa_counters_sum_distinct(m, vb, q, 1 ORDER BY vb) AS s,
+             (SELECT array_agg(CASE WHEN (bit_or(m) >> j) & 1 = 1 THEN 2 ELSE 0 END ORDER BY j)::real[]
+              FROM generate_series(0, 63) j) AS d
+      FROM d GROUP BY vb) t;
+
+-- the noised forms release the same values: world 0 without noise; noised ones share the
+-- sorted input and the transition state with the counters
+SELECT g, asa_noised_count_distinct(m, vi, q, 1 ORDER BY vi) = (asa_counters_count_distinct(m, vi, q, 1 ORDER BY vi))[1]
+           AS count_w0,
+       asa_noised_sum_distinct(m, vn, q, 1 ORDER BY vn) = 2 * sum(DISTINCT vn) FILTER (WHERE m & 1 = 1) AS sum_numeric_w0,
+       pg_typeof(asa_noised_sum_distinct(m, vi, q, 1 ORDER BY vi)) AS sum_type,
+       pg_typeof(asa_noised_avg_distinct(m, vn, q, 1 ORDER BY vn)) AS avg_type
+FROM d GROUP BY g ORDER BY g;
+
+-- without rows, or only NULL values: NULL (a cell in no world)
+SELECT asa_noised_count_distinct(m, vi, q, 1 ORDER BY vi) IS NULL AS no_rows,
+       asa_counters_sum_distinct(m, vi, q, 1 ORDER BY vi) IS NULL AS no_rows_counters FROM d WHERE false;
+SELECT asa_noised_count_distinct(m, vi, q, 1 ORDER BY vi) IS NULL AS only_nulls FROM d WHERE vi IS NULL;
+
+-- the input must be ordered by the value
+SELECT asa_noised_count_distinct(m, vi, q, 1) FROM d;
+SELECT asa_noised_count_distinct(m, vi, q, 1 ORDER BY vb) FROM d;
+
+-- ---------------------------------------------------------------------------
+-- The rewrite
+-- ---------------------------------------------------------------------------
+SELECT asa_add_entity('dt', 'k');
+SET simd_asa.rewrite = on;
+
+CREATE FUNCTION pg_temp.same(a regclass, b regclass) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    r boolean;
+BEGIN
+    EXECUTE format('SELECT NOT EXISTS (SELECT * FROM %s EXCEPT ALL SELECT * FROM %s) AND '
+                   'NOT EXISTS (SELECT * FROM %s EXCEPT ALL SELECT * FROM %s)', a, b, b, a) INTO r;
+    RETURN r;
+END
+$$;
+
+EXPLAIN (COSTS OFF, VERBOSE) SELECT g, count(DISTINCT vi), count(*) FROM dt GROUP BY g;
+SELECT g, count(DISTINCT vi), sum(DISTINCT vn), avg(DISTINCT vf) FROM dt GROUP BY g \gdesc
+CREATE TEMP TABLE rw AS
+SELECT g, count(DISTINCT vi) AS ci, count(DISTINCT vt) AS ct, sum(DISTINCT vb) AS sb, sum(DISTINCT vn) AS sn,
+       avg(DISTINCT vf) AS af, min(DISTINCT vi) AS mn, count(*) AS n, sum(vi) AS s
+FROM dt GROUP BY g;
+SET simd_asa.rewrite = off;
+CREATE TEMP TABLE hw AS
+SELECT g, asa_noised_count_distinct(m, vi, q, 1 ORDER BY vi) AS ci, asa_noised_count_distinct(m, vt, q, 1 ORDER BY vt) AS ct,
+       asa_noised_sum_distinct(m, vb, q, 1 ORDER BY vb) AS sb, asa_noised_sum_distinct(m, vn, q, 1 ORDER BY vn) AS sn,
+       asa_noised_avg_distinct(m, vf, q, 1 ORDER BY vf) AS af, as_noised_min(m, vi) AS mn, as_noised_count(m) AS n,
+       as_noised_sum(m, vi) AS s
+FROM d GROUP BY g;
+SELECT pg_temp.same('rw', 'hw') AS distinct_releases;
+DROP TABLE rw, hw;
+SET simd_asa.rewrite = on;
+
+-- HAVING and ORDER BY ... LIMIT over a distinct count (its counters share the state)
+CREATE TEMP TABLE rw AS SELECT g, count(DISTINCT vi) AS c FROM dt GROUP BY g HAVING count(DISTINCT vi) > 50;
+SET simd_asa.rewrite = off;
+CREATE TEMP TABLE hw AS SELECT g, asa_noised_count_distinct(m, vi, q, 1 ORDER BY vi) AS c FROM d GROUP BY g
+HAVING asa_filter(asa_lane_gt(asa_counters_count_distinct(m, vi, q, 1 ORDER BY vi), 50::float8), asa_query_hash());
+SELECT pg_temp.same('rw', 'hw') AS distinct_having, (SELECT count(*) FROM rw) AS groups;
+DROP TABLE rw, hw;
+SET simd_asa.rewrite = on;
+SELECT g, count(DISTINCT vt) FROM dt GROUP BY g ORDER BY 2 DESC LIMIT 2;
+
+-- counters mode: the asa_counters_* form
+SET simd_asa.counters = on;
+CREATE TEMP TABLE rw AS SELECT g, count(DISTINCT vi) AS c FROM dt GROUP BY g;
+SET simd_asa.rewrite = off;
+CREATE TEMP TABLE hw AS SELECT g, asa_counters_count_distinct(m, vi, q, 1 ORDER BY vi) AS c FROM d GROUP BY g;
+SELECT pg_temp.same('rw', 'hw') AS distinct_counters;
+DROP TABLE rw, hw;
+SET simd_asa.rewrite = on;
+RESET simd_asa.counters;
+
+-- the distinct value is in the worlds of any entity carrying it: no correction for rows of
+-- several entities (as DuckDB)
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT count(DISTINCT a.vi), count(*) FROM dt a JOIN dt b ON a.vb = b.vb AND a.k < b.k;
+
+RESET simd_asa.rewrite;
+SELECT asa_drop_entity('dt');
+DROP VIEW d;
+DROP TABLE dt;

@@ -59,7 +59,7 @@ SELECT g, n1.s <> w.w0 AS noised, abs(n1.s - w.mean) < 5 * 8 * w.sd AS plausible
 FROM n1 JOIN (SELECT g, (s)[1] AS w0, priv_mean(s) AS mean, (SELECT stddev(x) FROM unnest(s) x) AS sd
               FROM (SELECT g, as_sum(priv_hash(asa_hash(k)), vi) AS s FROM nt GROUP BY g) a) w USING (g) ORDER BY g;
 -- a different query hash draws different worlds and noise
-SELECT asa_noised_sum(priv_hash(asa_hash(k), 12345), vi, 12345) <> as_noised_sum(priv_hash(asa_hash(k)), vi)
+SELECT asa_noised_sum(priv_hash(asa_hash(k), 12345), vi, 12345, 1) <> as_noised_sum(priv_hash(asa_hash(k)), vi)
     AS other_query_hash FROM nt;
 -- cells of single entities are suppressed with probability popcount(~mask) / 64
 SELECT count(*) FILTER (WHERE s IS NULL) > 0 AS some_suppressed,
@@ -77,6 +77,34 @@ SET simd_asa.sample_diversity_check = off;
 SELECT count(s) >= 0 AS released FROM (SELECT k, as_noised_sum(priv_hash(asa_hash(k)), vi) AS s FROM nt GROUP BY k) t;
 RESET simd_asa.sample_diversity_check;
 RESET simd_asa.hash_repair;
+
+-- ---------------------------------------------------------------------------
+-- Correction (the asa_* forms' last argument): rows of k entities, whose masks are AND-ed,
+-- are in a world with probability 2^-k; the correction 2^(k-1) multiplies counts and sums,
+-- not extremes, and makes NULL cells 1/correction as likely
+-- ---------------------------------------------------------------------------
+SET simd_asa.noise = off;
+SELECT asa_noised_count(m, q, 4) = 4 * (as_count(m))[1] AS count_x4,
+       asa_noised_sum(m, vi, q, 4) = 4 * (as_sum(m, vi))[1] AS sum_x4,
+       asa_noised_sum(m, vn, q, 4) = 4 * asa_noised_sum(m, vn, q, 1) AS sum_numeric_x4,
+       asa_noised_avg(m, vf, q, 4) = asa_noised_avg(m, vf, q, 1) AS avg_unchanged,
+       asa_noised_max(m, vi, q, 4) = (as_max(m, vi))[1] AS max_unscaled,
+       asa_counters_count(m, q, 4) = asa_lane_mul(as_count(m), 4) AS counters_x4,
+       asa_counters_sum(m, vf, q, 4) = asa_lane_mul(as_sum(m, vf), 4) AS counters_sum_x4,
+       asa_counters_min(m, vi, q, 4) = as_min(m, vi) AS counters_min_unscaled
+FROM (SELECT *, priv_hash(asa_hash(k)) AS m, asa_query_hash() AS q FROM nt) t;
+SET simd_asa.noise = on;
+SET simd_asa.sample_diversity_check = off;
+CREATE TEMP TABLE nulls AS
+SELECT c, count(*) FILTER (WHERE s IS NULL) AS null_cells
+FROM unnest(ARRAY[1, 2, 4]) c,
+     LATERAL (SELECT k, asa_noised_sum(priv_hash(asa_hash(k)), vi, asa_query_hash(), c) AS s FROM nt GROUP BY k) t
+GROUP BY c;
+-- single-entity cells: popcount(~mask) is about 32, NULL with probability about 1/2, 1/4, 1/8
+SELECT c, null_cells BETWEEN 3000 / (2 * c) * 0.8 AND 3000 / (2 * c) * 1.2 AS expected_null_rate
+FROM nulls ORDER BY c;
+DROP TABLE nulls;
+RESET simd_asa.sample_diversity_check;
 
 -- ---------------------------------------------------------------------------
 -- Scalars

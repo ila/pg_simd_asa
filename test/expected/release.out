@@ -15,6 +15,12 @@ INSERT INTO p_customer SELECT c, c % 5, (c % 37) * 2.5 FROM generate_series(1, 3
 INSERT INTO p_orders SELECT o, o % 300 + 1, o % 97 FROM generate_series(1, 1500) o;
 INSERT INTO p_lineitem SELECT l % 1500 + 1, l % 50 + 1, (l % 13) * 1.5 FROM generate_series(1, 6000) l;
 INSERT INTO p_nation SELECT n, 'nation ' || n FROM generate_series(0, 9) n;
+-- autovacuum would invalidate the prepared statement below at random: its re-analysis
+-- draws the next per-statement nonce, and later statements other noise
+ALTER TABLE p_customer SET (autovacuum_enabled = off);
+ALTER TABLE p_orders SET (autovacuum_enabled = off);
+ALTER TABLE p_lineitem SET (autovacuum_enabled = off);
+ALTER TABLE p_nation SET (autovacuum_enabled = off);
 SELECT asa_add_entity('p_customer', 'c_custkey');
  asa_add_entity 
 ----------------
@@ -65,10 +71,10 @@ FROM p_customer GROUP BY 1 \gdesc
 (7 rows)
 
 EXPLAIN (COSTS OFF, VERBOSE) SELECT sum(o_total) FROM p_orders;
-                                                            QUERY PLAN                                                             
------------------------------------------------------------------------------------------------------------------------------------
+                                                                        QUERY PLAN                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
-   Output: asa_noised_sum(priv_hash(asa_hash(o_custkey), '-2141240251835189051'::bigint), o_total, '-2141240251835189051'::bigint)
+   Output: asa_noised_sum(priv_hash(asa_hash(o_custkey), '-2141240251835189051'::bigint), o_total, '-2141240251835189051'::bigint, '1'::double precision)
    ->  Seq Scan on public.p_orders
          Output: o_orderkey, o_custkey, o_total
 (4 rows)
@@ -114,10 +120,10 @@ SELECT sum(c_custkey) AS s, count(*) AS n FROM p_customer WHERE false;
 -- a non-aggregating subquery passes its row mask up (TPC-H Q7, Q8, Q9)
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT g, sum(t) FROM (SELECT o_total % 3 AS g, o_total AS t FROM p_orders) d GROUP BY g;
-                                                                                  QUERY PLAN                                                                                   
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                              QUERY PLAN                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  HashAggregate
-   Output: ((p_orders.o_total % 3)), asa_noised_sum(priv_hash(asa_hash(p_orders.o_custkey), '-2141240251835189051'::bigint), p_orders.o_total, '-2141240251835189051'::bigint)
+   Output: ((p_orders.o_total % 3)), asa_noised_sum(priv_hash(asa_hash(p_orders.o_custkey), '-2141240251835189051'::bigint), p_orders.o_total, '-2141240251835189051'::bigint, '1'::double precision)
    Group Key: (p_orders.o_total % 3)
    ->  Seq Scan on public.p_orders
          Output: (p_orders.o_total % 3), p_orders.o_custkey, p_orders.o_total
@@ -211,19 +217,19 @@ DROP TABLE rw, hw;
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT g, count(*) FROM (SELECT c_nation AS g FROM p_customer WHERE c_bal > (SELECT avg(c_bal) FROM p_customer)) t
 GROUP BY g;
-                                                                                                                             QUERY PLAN                                                                                                                             
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                        QUERY PLAN                                                                                                                                         
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  HashAggregate
-   Output: p_customer.c_nation, asa_noised(asa_counters_count((priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint) & asa_lane_gt((p_customer.c_bal)::double precision, $0)), '-2141240251835189051'::bigint), '-2141240251835189051'::bigint)
+   Output: p_customer.c_nation, asa_noised(asa_counters_count((priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint) & asa_lane_gt((p_customer.c_bal)::double precision, $0)), '-2141240251835189051'::bigint, '1'::double precision), '-2141240251835189051'::bigint)
    Group Key: p_customer.c_nation
    InitPlan 1 (returns $0)
      ->  Aggregate
-           Output: asa_counters_avg(priv_hash(asa_hash(p_customer_1.c_custkey), '-2141240251835189051'::bigint), p_customer_1.c_bal, '-2141240251835189051'::bigint)
+           Output: asa_counters_avg(priv_hash(asa_hash(p_customer_1.c_custkey), '-2141240251835189051'::bigint), p_customer_1.c_bal, '-2141240251835189051'::bigint, '1'::double precision)
            ->  Seq Scan on public.p_customer p_customer_1
                  Output: p_customer_1.c_custkey, p_customer_1.c_nation, p_customer_1.c_bal
    InitPlan 2 (returns $1)
      ->  Aggregate
-           Output: asa_counters_avg(priv_hash(asa_hash(p_customer_2.c_custkey), '-2141240251835189051'::bigint), p_customer_2.c_bal, '-2141240251835189051'::bigint)
+           Output: asa_counters_avg(priv_hash(asa_hash(p_customer_2.c_custkey), '-2141240251835189051'::bigint), p_customer_2.c_bal, '-2141240251835189051'::bigint, '1'::double precision)
            ->  Seq Scan on public.p_customer p_customer_2
                  Output: p_customer_2.c_custkey, p_customer_2.c_nation, p_customer_2.c_bal
    ->  Seq Scan on public.p_customer
@@ -278,17 +284,17 @@ DROP TABLE rw, hw;
 -- ---------------------------------------------------------------------------
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT c_nation, sum(c_custkey) AS s FROM p_customer GROUP BY 1 ORDER BY s DESC LIMIT 2;
-                                                                                                                                                                            QUERY PLAN                                                                                                                                                                            
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                                                   QUERY PLAN                                                                                                                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Subquery Scan on asa_topk
    Output: asa_topk.c_nation, asa_noised(asa_topk.asa_counters, '-2141240251835189051'::bigint), asa_topk.s
    ->  Limit
-         Output: p_customer.c_nation, (priv_mean(asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint))), (asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint))
+         Output: p_customer.c_nation, (priv_mean(asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint, '1'::double precision))), (asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint, '1'::double precision))
          ->  Sort
-               Output: p_customer.c_nation, (priv_mean(asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint))), (asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint))
-               Sort Key: (priv_mean(asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint))) DESC
+               Output: p_customer.c_nation, (priv_mean(asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint, '1'::double precision))), (asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint, '1'::double precision))
+               Sort Key: (priv_mean(asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint, '1'::double precision))) DESC
                ->  HashAggregate
-                     Output: p_customer.c_nation, priv_mean(asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint)), asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint)
+                     Output: p_customer.c_nation, priv_mean(asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint, '1'::double precision)), asa_counters_sum(priv_hash(asa_hash(p_customer.c_custkey), '-2141240251835189051'::bigint), p_customer.c_custkey, '-2141240251835189051'::bigint, '1'::double precision)
                      Group Key: p_customer.c_nation
                      ->  Seq Scan on public.p_customer
                            Output: p_customer.c_custkey, p_customer.c_nation, p_customer.c_bal

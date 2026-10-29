@@ -33,6 +33,8 @@ run unchanged and return what the DuckDB extension returns.
 | `priv_filter(mask bigint)` | `boolean` | whether a row passes a predicate that holds in the worlds of `mask` |
 | `priv_mean(counters real[])` | `double precision` | mean of the non-NULL worlds |
 | `asa_query_hash()` | `bigint` | the query hash of `priv_hash(bigint)` and `as_noised_*` |
+| `asa_noised_*` / `asa_counters_*(mask, [value], query_hash, correction)` | release / `real[64]` | the forms the rewrite uses: explicit query hash and [correction](#automatic-rewrite) |
+| `asa_noised/counters_count/sum/avg_distinct(mask, value, query_hash, correction ORDER BY value)` | release / `real[64]` | `count/sum/avg(DISTINCT value)`: a distinct value is in the worlds of any row carrying it |
 
 Settings: `simd_asa.seed` (default 42) re-draws the assignment of entities to worlds;
 `simd_asa.hash_repair` (default off) repairs every mask to exactly 32 set bits. The noise
@@ -96,6 +98,9 @@ aggregate returns (`count` → `bigint`, `sum(integer)` → `bigint`, `sum(numer
 3. `as_noised_avg` releases a noised sum and a noised count and divides them (DuckDB's AVG
    rewrite). `numeric` sums are computed as DuckDB sums `DECIMAL`: integers times
    10^scale on the integer kernel, the scale derived from the argument's type.
+4. **Correction.** The `asa_*` forms take DuckDB's correction factor (2^(k−1) for rows of
+   *k* entities, see [Automatic rewrite](#automatic-rewrite)): it multiplies counts and sums
+   (not extremes; averages are unchanged) and divides the NULL probability.
 
 | Setting | Default | |
 |---|---|---|
@@ -107,7 +112,9 @@ aggregate returns (`count` → `bigint`, `sum(integer)` → `bigint`, `sum(numer
 
 Randomness comes from a per-statement generator seeded by the query hash; it and the
 p-tracking posterior restart when a top-level statement starts, so re-executing a prepared
-statement releases the same values instead of fresh noise that could be averaged out.
+statement releases the same values instead of fresh noise that could be averaged out. (When
+PostgreSQL re-analyzes a prepared statement, after DDL or new statistics on its tables, the
+rewrite runs again and draws a new nonce.)
 
 ## Automatic rewrite
 
@@ -142,11 +149,16 @@ The rewrite is the PostgreSQL counterpart of DuckDB's PAC compiler. It works lev
    injected join when it is missing (`lineitem` alone gets `orders`), or directly when the
    link points at the entity (`o_custkey`). The row mask is the AND over the distinct keys of
    `priv_hash(asa_hash(key), query_hash)`: a row joined from two customers belongs to the
-   worlds containing both.
+   worlds containing both. Such a row is in a world with probability 2⁻ᵏ for *k* customers,
+   not ½, so the aggregates take DuckDB's correction 2^(k−1). Keys equal by a join condition
+   are one customer (`a.o_custkey = b.o_custkey`), as is a key a subquery exposes along with
+   its mask.
 2. **Releases.** `sum`/`count`/`avg`/`min`/`max` become noised aggregates of the same result
    type. An arithmetic expression over several aggregates is evaluated per world and released
    once (`asa_lane_*`, then `as_noised`: TPC-H Q8, Q14); other expressions — `round(...)`,
-   `sum(x) > 10`, `/ 7.0` — apply to the released values.
+   `sum(x) > 10`, `/ 7.0` — apply to the released values. `count/sum/avg(DISTINCT v)` count
+   each distinct value in the worlds of any of its rows (`asa_*_distinct`, DuckDB's `bit_or`
+   pre-aggregation); `min/max(DISTINCT v)` are `min/max(v)`.
 3. **Subqueries.** A `FROM`-clause subquery that does not aggregate passes its row mask up as
    an extra column (Q7, Q8, Q9). One that aggregates is released in place, e.g. a CTE (Q15).
    One grouped by the entity key, or by a column that determines the entity (`l_orderkey`),
@@ -176,8 +188,8 @@ unchanged.
 
 The rewrite runs at parse analysis (`post_parse_analyze_hook`), so result types are consistent
 for prepared statements and the extended protocol. Shapes it does not implement are rejected
-with an error rather than answered with ordinary one-world results: `DISTINCT` aggregates,
-window functions and grouping sets over entity-dependent rows, set operations, views and
+with an error rather than answered with ordinary one-world results: `ORDER BY` inside
+aggregates, window functions and grouping sets over entity-dependent rows, set operations, views and
 non-aggregating CTEs over entity-dependent relations (use a subquery), entity-dependent
 relations on the nullable side of an outer join (outside a subquery grouped by the entity),
 and `IN` / `EXISTS` sub-selects that aggregate other than per entity. Per-world arithmetic is
@@ -208,11 +220,13 @@ releases: world 0 without noise, result types, NULL cells, reproducibility, nois
 expected deviation, the sample-diversity check and the filter probabilities.
 `test/sql/rewrite.sql` checks the rewrite in counters mode — every rewritten query must return
 exactly the hand-written `as_*` query's result (entity table, direct link, injected join,
-reused joins, two entities, `FILTER`, `ORDER BY`, prepared statements, entity selection) —
-and the rejected shapes. `test/sql/release.sql` checks the default releases the same way
+reused joins, two entities and their correction, `FILTER`, `ORDER BY`, prepared statements,
+entity selection) — and the rejected shapes. `test/sql/release.sql` checks the default releases the same way
 against hand-written `as_noised_*` queries: expressions, derived tables, per-entity subqueries,
 CTEs, predicates over worlds as masks and as filters, `HAVING`, top-k, parallel query and
-prepared statements.
+prepared statements. `test/sql/distinct.sql` checks every world of the `DISTINCT` aggregates
+against the definition (the aggregate over the distinct values of the rows in world *j*) and
+their rewrite, `HAVING` and top-k included.
 
 `bench/tpch_crosscheck.py` runs the 22 TPC-H queries (the texts DuckDB ships,
 `bench/tpch_queries`) through the rewrite without noise and compares them with the DuckDB
@@ -221,7 +235,11 @@ extension's results (`bench/duckdb_reference.sh`: its automatic PAC rewrite with
 agree (values within 10⁻⁵ relative). Q15 is checked differently: DuckDB's rewrite of its CTE
 releases different values depending on how the CTE is read (per supplier, under `max()`,
 under `ORDER BY ... LIMIT`), so DuckDB's answer is not its own largest released revenue;
-PostgreSQL's is.
+PostgreSQL's is. It also runs four `DISTINCT` queries over TPC-H (`bench/tpch_distinct`,
+against DuckDB's rewrite: all agree) and checks the correction on a self-join of orders of
+two different customers, which DuckDB cannot answer the same way (it masks a self-join by one
+of the two customers): the corrected counts are within 2% of the exact ones (0.8% at SF1;
+uncorrected they would be half).
 
 ```sh
 bench/duckdb_reference.sh ../privacy/build/release/duckdb tpch1.duckdb ../privacy /tmp/ref
@@ -370,8 +388,16 @@ Deviations from the DuckDB code:
   distributed as in DuckDB, not identical to them. Every cell of a statement draws from one
   generator (DuckDB reseeds per vector of groups), and without an explicit seed the
   per-statement nonce is random (DuckDB: the query id).
-- DP mechanisms and the remaining PAC options are not ported: the `correction` factor,
-  utility NULLing (`privacy_min_group_count`), clipping (`as_clip_*`), sample-and-aggregate
+- `DISTINCT` aggregates sort their input by the value (an ordered aggregate, as PostgreSQL's
+  own `count(DISTINCT)`) instead of pre-aggregating with `bit_or`; the values each feed the
+  base aggregate once with their OR-ed mask, so the releases are DuckDB's. Like
+  PostgreSQL's `DISTINCT` aggregates they are not parallelized. As in DuckDB they take no
+  correction.
+- The correction is static: *k* counts the distinct keys of the level, so in a self-join
+  without an equality on the key, pairs that happen to share a customer weigh double (their
+  masks are equal: in a world with probability ½, not ¼). DuckDB derives one hash per
+  privacy-unit table, so its self-joins mask by one of the two customers instead.
+- DP mechanisms and the remaining PAC options are not ported: utility NULLing (`privacy_min_group_count`), clipping (`as_clip_*`), sample-and-aggregate
   (`as_sample_*`) and *m* ≠ 64.
 
 ## License

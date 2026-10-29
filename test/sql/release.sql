@@ -16,6 +16,12 @@ INSERT INTO p_customer SELECT c, c % 5, (c % 37) * 2.5 FROM generate_series(1, 3
 INSERT INTO p_orders SELECT o, o % 300 + 1, o % 97 FROM generate_series(1, 1500) o;
 INSERT INTO p_lineitem SELECT l % 1500 + 1, l % 50 + 1, (l % 13) * 1.5 FROM generate_series(1, 6000) l;
 INSERT INTO p_nation SELECT n, 'nation ' || n FROM generate_series(0, 9) n;
+-- autovacuum would invalidate the prepared statement below at random: its re-analysis
+-- draws the next per-statement nonce, and later statements other noise
+ALTER TABLE p_customer SET (autovacuum_enabled = off);
+ALTER TABLE p_orders SET (autovacuum_enabled = off);
+ALTER TABLE p_lineitem SET (autovacuum_enabled = off);
+ALTER TABLE p_nation SET (autovacuum_enabled = off);
 SELECT asa_add_entity('p_customer', 'c_custkey');
 SELECT asa_add_link('p_orders', 'o_custkey', 'p_customer', 'c_custkey');
 SELECT asa_add_link('p_lineitem', 'l_orderkey', 'p_orders', 'o_orderkey');

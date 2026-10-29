@@ -211,13 +211,14 @@ SELECT pg_temp.same('rw', 'hw') AS reused_joins;
 (1 row)
 
 DROP TABLE rw, hw;
--- tuples derived from two different entities belong to the worlds containing both
+-- tuples derived from two different entities belong to the worlds containing both, with
+-- probability 1/4: counts and sums are multiplied by the correction 2^(2-1) = 2
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT count(*) FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey;
-                                                                        QUERY PLAN                                                                         
------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                           QUERY PLAN                                                                                           
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
-   Output: as_count((priv_hash(asa_hash(a.o_custkey), '-2141240251835189051'::bigint) & priv_hash(asa_hash(b.o_custkey), '-2141240251835189051'::bigint)))
+   Output: asa_lane_mul(as_count((priv_hash(asa_hash(a.o_custkey), '-2141240251835189051'::bigint) & priv_hash(asa_hash(b.o_custkey), '-2141240251835189051'::bigint))), '2'::double precision)
    ->  Merge Join
          Output: a.o_custkey, b.o_custkey
          Merge Cond: (a.o_total = b.o_total)
@@ -234,10 +235,12 @@ SELECT count(*) FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o
                      Output: b.o_custkey, b.o_total, b.o_orderkey
 (16 rows)
 
-CREATE TEMP TABLE rw AS SELECT count(*) AS n
+CREATE TEMP TABLE rw AS SELECT count(*) AS n, sum(a.o_total) AS s, avg(b.o_total) AS a, max(a.o_total) AS mx
 FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey;
-CREATE TEMP TABLE hw AS SELECT as_count(priv_hash(asa_hash(a.o_custkey)) & priv_hash(asa_hash(b.o_custkey))) AS n
-FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey;
+CREATE TEMP TABLE hw AS SELECT asa_lane_mul(as_count(m), 2) AS n, asa_lane_mul(as_sum(m, a.o_total), 2) AS s,
+                               as_avg(m, b.o_total) AS a, as_max(m, a.o_total) AS mx
+FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey,
+     LATERAL (SELECT priv_hash(asa_hash(a.o_custkey)) & priv_hash(asa_hash(b.o_custkey)) AS m) l;
 SELECT pg_temp.same('rw', 'hw') AS two_entities;
  two_entities 
 --------------
@@ -245,6 +248,99 @@ SELECT pg_temp.same('rw', 'hw') AS two_entities;
 (1 row)
 
 DROP TABLE rw, hw;
+-- the definition: world j counts 2 x 2 x the pairs whose two customers are both in world j
+CREATE TEMP TABLE rw AS SELECT count(*) AS n
+FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_custkey < b.o_custkey;
+SELECT count(*) FILTER (WHERE r.v <> d.n) AS worlds_differing
+FROM (SELECT ordinality - 1 AS j, v FROM rw, unnest(rw.n) WITH ORDINALITY u(v, ordinality)) r
+JOIN (SELECT j, 4 * count(*) AS n
+      FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_custkey < b.o_custkey,
+           generate_series(0, 63) j
+      WHERE (priv_hash(asa_hash(a.o_custkey)) >> j) & 1 = 1 AND (priv_hash(asa_hash(b.o_custkey)) >> j) & 1 = 1
+      GROUP BY j) d USING (j);
+ worlds_differing 
+------------------
+                0
+(1 row)
+
+DROP TABLE rw;
+-- keys equal by a join condition are one entity: one mask, no correction
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT count(*) FROM r_orders a JOIN r_orders b ON a.o_custkey = b.o_custkey AND a.o_orderkey < b.o_orderkey;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Aggregate
+   Output: as_count(priv_hash(asa_hash(a.o_custkey), '-2141240251835189051'::bigint))
+   ->  Merge Join
+         Output: a.o_custkey
+         Merge Cond: (a.o_custkey = b.o_custkey)
+         Join Filter: (a.o_orderkey < b.o_orderkey)
+         ->  Sort
+               Output: a.o_custkey, a.o_orderkey
+               Sort Key: a.o_custkey
+               ->  Seq Scan on public.r_orders a
+                     Output: a.o_custkey, a.o_orderkey
+         ->  Sort
+               Output: b.o_custkey, b.o_orderkey
+               Sort Key: b.o_custkey
+               ->  Seq Scan on public.r_orders b
+                     Output: b.o_custkey, b.o_orderkey
+(16 rows)
+
+-- ... also when a subquery exposes the key it derives its mask from ...
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT c_nation, count(*) FROM (SELECT o_custkey, o_total FROM r_orders WHERE o_total > 10) o
+JOIN r_customer ON c_custkey = o.o_custkey GROUP BY 1;
+                                                    QUERY PLAN                                                    
+------------------------------------------------------------------------------------------------------------------
+ HashAggregate
+   Output: r_customer.c_nation, as_count(priv_hash(asa_hash(r_orders.o_custkey), '-2141240251835189051'::bigint))
+   Group Key: r_customer.c_nation
+   ->  Hash Join
+         Output: r_customer.c_nation, r_orders.o_custkey
+         Hash Cond: (r_customer.c_custkey = r_orders.o_custkey)
+         ->  Seq Scan on public.r_customer
+               Output: r_customer.c_custkey, r_customer.c_nation
+         ->  Hash
+               Output: r_orders.o_custkey
+               ->  Seq Scan on public.r_orders
+                     Output: r_orders.o_custkey
+                     Filter: (r_orders.o_total > 10)
+(13 rows)
+
+CREATE TEMP TABLE rw AS SELECT c_nation, count(*) AS n FROM (SELECT o_custkey, o_total FROM r_orders WHERE o_total > 10) o
+JOIN r_customer ON c_custkey = o.o_custkey GROUP BY 1;
+CREATE TEMP TABLE hw AS SELECT c_nation, as_count(priv_hash(asa_hash(c_custkey))) AS n
+FROM r_orders JOIN r_customer ON c_custkey = o_custkey WHERE o_total > 10 GROUP BY 1;
+SELECT pg_temp.same('rw', 'hw') AS exposed_key;
+ exposed_key 
+-------------
+ t
+(1 row)
+
+DROP TABLE rw, hw;
+-- ... but a subquery's entity without an exposed key counts as one more
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT count(*) FROM (SELECT o_total FROM r_orders) o JOIN r_customer ON c_custkey = o.o_total;
+                                                                                                   QUERY PLAN                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   Output: asa_lane_mul(as_count((priv_hash(asa_hash(r_orders.o_custkey), '-2141240251835189051'::bigint) & priv_hash(asa_hash(r_customer.c_custkey), '-2141240251835189051'::bigint))), '2'::double precision)
+   ->  Merge Join
+         Output: r_orders.o_custkey, r_customer.c_custkey
+         Merge Cond: (r_orders.o_total = r_customer.c_custkey)
+         ->  Sort
+               Output: r_orders.o_custkey, r_orders.o_total
+               Sort Key: r_orders.o_total
+               ->  Seq Scan on public.r_orders
+                     Output: r_orders.o_custkey, r_orders.o_total
+         ->  Sort
+               Output: r_customer.c_custkey
+               Sort Key: r_customer.c_custkey
+               ->  Seq Scan on public.r_customer
+                     Output: r_customer.c_custkey
+(15 rows)
+
 -- FILTER is kept; ORDER BY / DISTINCT on a rewritten column sort the arrays
 CREATE TEMP TABLE rw AS SELECT c_nation, count(*) FILTER (WHERE c_custkey > 100) AS n FROM r_customer GROUP BY 1;
 CREATE TEMP TABLE hw AS SELECT c_nation, as_count(priv_hash(asa_hash(c_custkey))) FILTER (WHERE c_custkey > 100) AS n
@@ -333,8 +429,8 @@ DROP TABLE rw, hw;
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT sum(l_price) FROM r_lineitem l1
 WHERE l_qty < (SELECT avg(l_qty) FROM r_lineitem l2 WHERE l2.l_orderkey % 10 = l1.l_orderkey % 10);
-                                                                              QUERY PLAN                                                                              
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                     QUERY PLAN                                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
    Output: as_sum((priv_hash(asa_hash(asa_r_orders.o_custkey), '-2141240251835189051'::bigint) & asa_lane_lt((l1.l_qty)::double precision, (SubPlan 1))), l1.l_price)
    ->  Merge Join
@@ -352,7 +448,7 @@ WHERE l_qty < (SELECT avg(l_qty) FROM r_lineitem l2 WHERE l2.l_orderkey % 10 = l
                      Output: l1.l_qty, l1.l_orderkey, l1.l_price
    SubPlan 1
      ->  Aggregate
-           Output: asa_counters_avg(priv_hash(asa_hash(asa_r_orders_1.o_custkey), '-2141240251835189051'::bigint), l2.l_qty, '-2141240251835189051'::bigint)
+           Output: asa_counters_avg(priv_hash(asa_hash(asa_r_orders_1.o_custkey), '-2141240251835189051'::bigint), l2.l_qty, '-2141240251835189051'::bigint, '1'::double precision)
            ->  Hash Join
                  Output: asa_r_orders_1.o_custkey, l2.l_qty
                  Hash Cond: (asa_r_orders_1.o_orderkey = l2.l_orderkey)
@@ -386,13 +482,13 @@ DROP TABLE rw, def;
 SET simd_asa.rewrite = on;
 -- outer rows that are shared by all worlds: the predicate alone decides the worlds
 EXPLAIN (COSTS OFF, VERBOSE) SELECT count(*) FROM r_nation WHERE n_key < (SELECT avg(c_nation) FROM r_customer);
-                                                                             QUERY PLAN                                                                             
---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                        QUERY PLAN                                                                                         
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
    Output: as_count(asa_lane_lt((r_nation.n_key)::double precision, $0))
    InitPlan 1 (returns $0)
      ->  Aggregate
-           Output: asa_counters_avg(priv_hash(asa_hash(r_customer.c_custkey), '-2141240251835189051'::bigint), r_customer.c_nation, '-2141240251835189051'::bigint)
+           Output: asa_counters_avg(priv_hash(asa_hash(r_customer.c_custkey), '-2141240251835189051'::bigint), r_customer.c_nation, '-2141240251835189051'::bigint, '1'::double precision)
            ->  Seq Scan on public.r_customer
                  Output: r_customer.c_custkey, r_customer.c_nation
    ->  Seq Scan on public.r_nation
@@ -466,8 +562,8 @@ HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewri
 SELECT round(sum(o_total)) FROM r_orders;
 ERROR:  SIMD-ASA rewrite: this expression over aggregates cannot be evaluated per world (supported: + - * / and casts)
 HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
-SELECT count(DISTINCT o_custkey) FROM r_orders;
-ERROR:  SIMD-ASA rewrite: count(DISTINCT ...) is not supported
+SELECT sum(o_total ORDER BY o_total) FROM r_orders;
+ERROR:  SIMD-ASA rewrite: ORDER BY inside sum(...) is not supported
 HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
 SELECT min(l_ship) FROM r_lineitem;
 ERROR:  SIMD-ASA rewrite: min(date) is not supported (smallint, integer, bigint, real, double precision, numeric)

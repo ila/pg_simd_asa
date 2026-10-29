@@ -86,14 +86,14 @@ typedef struct AsaSumIntPair
 	AsaSumIntState pos;
 	AsaSumIntState *neg;
 	int32		scale;			/* numeric: values are summed as integers times 10^scale */
-	uint64		query_hash;		/* asa_* forms: the statement's query hash */
+	AsaReleaseParams rel;		/* asa_* forms */
 } AsaSumIntPair;
 
 typedef struct AsaSumFloatState
 {
 	uint64		key_hash;
 	uint64		update_count;
-	uint64		query_hash;		/* asa_* forms: the statement's query hash */
+	AsaReleaseParams rel;		/* asa_* forms */
 	float		totals[ASA_LANES];	/* approximate double with float, as in DuckDB */
 } AsaSumFloatState;
 
@@ -333,7 +333,8 @@ asa_sum_pair_init(AsaSumIntPair *p)
 	asa_sum_int_init(&p->pos);
 	p->neg = NULL;
 	p->scale = 0;
-	p->query_hash = 0;
+	p->rel.query_hash = 0;
+	p->rel.correction = 0;
 }
 
 static inline AsaSumIntState *
@@ -385,8 +386,7 @@ asa_sum_pair_combine(AsaSumIntPair *dst, AsaSumIntPair *src, MemoryContext ctx)
 			elog(ERROR, "SIMD-ASA: cannot combine numeric sums of scale %d and %d", dst->scale, src->scale);
 		dst->scale = src->scale;	/* dst is still empty */
 	}
-	if (!dst->query_hash)
-		dst->query_hash = src->query_hash;
+	asa_release_params_merge(&dst->rel, &src->rel);
 	asa_sum_int_combine(&dst->pos, &src->pos, ctx);
 	if (src->neg)
 		asa_sum_int_combine(asa_sum_pair_ensure_neg(dst, ctx), src->neg, ctx);
@@ -395,7 +395,7 @@ asa_sum_pair_combine(AsaSumIntPair *dst, AsaSumIntPair *src, MemoryContext ctx)
 static Size
 asa_sum_pair_serial_size(const AsaSumIntPair *p)
 {
-	return asa_sum_int_serial_size(&p->pos) + sizeof(bool) + sizeof(int32) + sizeof(uint64) +
+	return asa_sum_int_serial_size(&p->pos) + sizeof(bool) + sizeof(int32) + sizeof(AsaReleaseParams) +
 		(p->neg ? asa_sum_int_serial_size(p->neg) : 0);
 }
 
@@ -406,7 +406,7 @@ asa_sum_pair_write(AsaWriter *w, const AsaSumIntPair *p)
 
 	asa_sum_int_write(w, &p->pos);
 	asa_write(w, &p->scale, sizeof(int32));
-	asa_write(w, &p->query_hash, sizeof(uint64));
+	asa_write(w, &p->rel, sizeof(AsaReleaseParams));
 	asa_write(w, &has_neg, sizeof(bool));
 	if (has_neg)
 		asa_sum_int_write(w, p->neg);
@@ -420,7 +420,7 @@ asa_sum_pair_read(AsaReader *r, AsaSumIntPair *p)
 	asa_sum_pair_init(p);
 	asa_sum_int_read(r, &p->pos);
 	asa_read(r, &p->scale, sizeof(int32));
-	asa_read(r, &p->query_hash, sizeof(uint64));
+	asa_read(r, &p->rel, sizeof(AsaReleaseParams));
 	asa_read(r, &has_neg, sizeof(bool));
 	if (has_neg)
 		asa_sum_int_read(r, asa_sum_pair_ensure_neg(p, CurrentMemoryContext));
@@ -447,8 +447,7 @@ asa_sum_float_combine(AsaSumFloatState *dst, const AsaSumFloatState *src)
 {
 	dst->key_hash |= src->key_hash;
 	dst->update_count += src->update_count;
-	if (!dst->query_hash)
-		dst->query_hash = src->query_hash;
+	asa_release_params_merge(&dst->rel, &src->rel);
 	for (int j = 0; j < ASA_LANES; j++)
 		dst->totals[j] += src->totals[j];
 }
@@ -686,6 +685,7 @@ as_sum_int_final(PG_FUNCTION_ARGS)
 	asa_float	out[ASA_LANES];
 
 	asa_sum_output(p ? asa_sum_pair_totals(p, totals) : 0, totals, out);
+	asa_correct_counters(out, p ? &p->rel : NULL);
 	PG_RETURN_ARRAYTYPE_P(asa_make_array(out));
 }
 
@@ -701,6 +701,7 @@ as_sum_float_final(PG_FUNCTION_ARGS)
 		for (int j = 0; j < ASA_LANES; j++)
 			totals[j] = s->totals[j];
 	asa_sum_output(s ? s->key_hash : 0, totals, out);
+	asa_correct_counters(out, s ? &s->rel : NULL);
 	PG_RETURN_ARRAYTYPE_P(asa_make_array(out));
 }
 
@@ -753,12 +754,11 @@ asa_sum_float_counters(const AsaSumFloatState *s, asa_float *out, uint64 *update
 
 static Datum
 asa_sum_noised_release(FunctionCallInfo fcinfo, const asa_float *counters, uint64 key_hash, uint64 update_count,
-					   uint64 query_hash)
+					   AsaReleaseParams rel)
 {
 	double		value;
 
-	if (!asa_release(fcinfo, 0, counters, key_hash, update_count, query_hash,
-					 "as_noised_sum", &value))
+	if (!asa_release(fcinfo, 0, counters, key_hash, update_count, &rel, true, "as_noised_sum", &value))
 		PG_RETURN_NULL();
 	PG_RETURN_DATUM(asa_release_datum(fcinfo, value));
 }
@@ -773,7 +773,7 @@ asa_sum_noised_release(FunctionCallInfo fcinfo, const asa_float *counters, uint6
 		uint64		update_count; \
 		uint64		key_hash = COUNTERS(s, counters, &update_count); \
 		return asa_sum_noised_release(fcinfo, counters, key_hash, update_count, \
-									  asa_agg_query_hash(FROM_ARG, s ? s->query_hash : 0)); \
+									  asa_agg_release_params(FROM_ARG, s ? &s->rel : NULL)); \
 	}
 
 ASA_DEFINE_SUM_NOISED_FINAL(as_sum_int_noised_final, AsaSumIntPair, asa_sum_int_counters, false)
@@ -965,16 +965,16 @@ as_avg_float_final(PG_FUNCTION_ARGS)
 /* Noised sum / noised count; NULL if either release is NULL or the count is 0. */
 static Datum
 asa_avg_noised_release(FunctionCallInfo fcinfo, const asa_float *sums, uint64 sum_key_hash, uint64 sum_rows,
-					   const AsaCountState *count, uint64 query_hash)
+					   const AsaCountState *count, AsaReleaseParams rel)
 {
 	asa_float	counts[ASA_LANES];
 	double		sum;
 	double		cnt;
 
 	asa_count_finalize(count, counts);
-	if (!asa_release(fcinfo, 0, sums, sum_key_hash, sum_rows, query_hash, "as_noised_sum", &sum))
+	if (!asa_release(fcinfo, 0, sums, sum_key_hash, sum_rows, &rel, true, "as_noised_sum", &sum))
 		PG_RETURN_NULL();
-	if (!asa_release(fcinfo, 1, counts, count->key_hash, count->update_count + count->swar_fill, query_hash,
+	if (!asa_release(fcinfo, 1, counts, count->key_hash, count->update_count + count->swar_fill, &rel, true,
 					 "as_noised_count", &cnt))
 		PG_RETURN_NULL();
 	if (cnt == 0)
@@ -994,7 +994,7 @@ asa_avg_int_noised(FunctionCallInfo fcinfo, bool from_arg)
 		PG_RETURN_NULL();
 	key_hash = asa_sum_int_counters(&s->sum, sums, &rows);
 	return asa_avg_noised_release(fcinfo, sums, key_hash, rows, &s->count,
-								  asa_agg_query_hash(from_arg, s->sum.query_hash));
+								  asa_agg_release_params(from_arg, &s->sum.rel));
 }
 
 static Datum
@@ -1009,7 +1009,7 @@ asa_avg_float_noised(FunctionCallInfo fcinfo, bool from_arg)
 		PG_RETURN_NULL();
 	key_hash = asa_sum_float_counters(&s->sum, sums, &rows);
 	return asa_avg_noised_release(fcinfo, sums, key_hash, rows, &s->count,
-								  asa_agg_query_hash(from_arg, s->sum.query_hash));
+								  asa_agg_release_params(from_arg, &s->sum.rel));
 }
 
 PG_FUNCTION_INFO_V1(as_avg_int_noised_final);
@@ -1137,18 +1137,18 @@ as_avg_float_deserial(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(s);
 }
 
-/* Transition functions of the asa_* forms (query hash as the last argument, 3). */
-ASA_DEFINE_QTRANS(as_sum_int2_qtrans, as_sum_int2_trans, AsaSumIntPair, query_hash, 3)
-ASA_DEFINE_QTRANS(as_sum_int4_qtrans, as_sum_int4_trans, AsaSumIntPair, query_hash, 3)
-ASA_DEFINE_QTRANS(as_sum_int8_qtrans, as_sum_int8_trans, AsaSumIntPair, query_hash, 3)
-ASA_DEFINE_QTRANS(as_sum_float4_qtrans, as_sum_float4_trans, AsaSumFloatState, query_hash, 3)
-ASA_DEFINE_QTRANS(as_sum_float8_qtrans, as_sum_float8_trans, AsaSumFloatState, query_hash, 3)
-ASA_DEFINE_QTRANS(as_sum_numeric_qtrans, as_sum_numeric_trans, AsaSumFloatState, query_hash, 3)
-ASA_DEFINE_QTRANS(as_sum_numeric_scaled_qtrans, as_sum_numeric_scaled_trans, AsaSumIntPair, query_hash, 3)
-ASA_DEFINE_QTRANS(as_avg_int2_qtrans, as_avg_int2_trans, AsaAvgIntState, sum.query_hash, 3)
-ASA_DEFINE_QTRANS(as_avg_int4_qtrans, as_avg_int4_trans, AsaAvgIntState, sum.query_hash, 3)
-ASA_DEFINE_QTRANS(as_avg_int8_qtrans, as_avg_int8_trans, AsaAvgIntState, sum.query_hash, 3)
-ASA_DEFINE_QTRANS(as_avg_float4_qtrans, as_avg_float4_trans, AsaAvgFloatState, sum.query_hash, 3)
-ASA_DEFINE_QTRANS(as_avg_float8_qtrans, as_avg_float8_trans, AsaAvgFloatState, sum.query_hash, 3)
-ASA_DEFINE_QTRANS(as_avg_numeric_qtrans, as_avg_numeric_trans, AsaAvgFloatState, sum.query_hash, 3)
-ASA_DEFINE_QTRANS(as_avg_numeric_scaled_qtrans, as_avg_numeric_scaled_trans, AsaAvgIntState, sum.query_hash, 3)
+/* Transition functions of the asa_* forms (release parameters as the last arguments, 3 and 4). */
+ASA_DEFINE_QTRANS(as_sum_int2_qtrans, as_sum_int2_trans, AsaSumIntPair, rel, 3)
+ASA_DEFINE_QTRANS(as_sum_int4_qtrans, as_sum_int4_trans, AsaSumIntPair, rel, 3)
+ASA_DEFINE_QTRANS(as_sum_int8_qtrans, as_sum_int8_trans, AsaSumIntPair, rel, 3)
+ASA_DEFINE_QTRANS(as_sum_float4_qtrans, as_sum_float4_trans, AsaSumFloatState, rel, 3)
+ASA_DEFINE_QTRANS(as_sum_float8_qtrans, as_sum_float8_trans, AsaSumFloatState, rel, 3)
+ASA_DEFINE_QTRANS(as_sum_numeric_qtrans, as_sum_numeric_trans, AsaSumFloatState, rel, 3)
+ASA_DEFINE_QTRANS(as_sum_numeric_scaled_qtrans, as_sum_numeric_scaled_trans, AsaSumIntPair, rel, 3)
+ASA_DEFINE_QTRANS(as_avg_int2_qtrans, as_avg_int2_trans, AsaAvgIntState, sum.rel, 3)
+ASA_DEFINE_QTRANS(as_avg_int4_qtrans, as_avg_int4_trans, AsaAvgIntState, sum.rel, 3)
+ASA_DEFINE_QTRANS(as_avg_int8_qtrans, as_avg_int8_trans, AsaAvgIntState, sum.rel, 3)
+ASA_DEFINE_QTRANS(as_avg_float4_qtrans, as_avg_float4_trans, AsaAvgFloatState, sum.rel, 3)
+ASA_DEFINE_QTRANS(as_avg_float8_qtrans, as_avg_float8_trans, AsaAvgFloatState, sum.rel, 3)
+ASA_DEFINE_QTRANS(as_avg_numeric_qtrans, as_avg_numeric_trans, AsaAvgFloatState, sum.rel, 3)
+ASA_DEFINE_QTRANS(as_avg_numeric_scaled_qtrans, as_avg_numeric_scaled_trans, AsaAvgIntState, sum.rel, 3)

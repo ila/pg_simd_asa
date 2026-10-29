@@ -90,15 +90,45 @@ FROM r_customer JOIN r_orders ON c_custkey = o_custkey JOIN r_lineitem ON o_orde
 SELECT pg_temp.same('rw', 'hw') AS reused_joins;
 DROP TABLE rw, hw;
 
--- tuples derived from two different entities belong to the worlds containing both
+-- tuples derived from two different entities belong to the worlds containing both, with
+-- probability 1/4: counts and sums are multiplied by the correction 2^(2-1) = 2
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT count(*) FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey;
-CREATE TEMP TABLE rw AS SELECT count(*) AS n
+CREATE TEMP TABLE rw AS SELECT count(*) AS n, sum(a.o_total) AS s, avg(b.o_total) AS a, max(a.o_total) AS mx
 FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey;
-CREATE TEMP TABLE hw AS SELECT as_count(priv_hash(asa_hash(a.o_custkey)) & priv_hash(asa_hash(b.o_custkey))) AS n
-FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey;
+CREATE TEMP TABLE hw AS SELECT asa_lane_mul(as_count(m), 2) AS n, asa_lane_mul(as_sum(m, a.o_total), 2) AS s,
+                               as_avg(m, b.o_total) AS a, as_max(m, a.o_total) AS mx
+FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_orderkey < b.o_orderkey,
+     LATERAL (SELECT priv_hash(asa_hash(a.o_custkey)) & priv_hash(asa_hash(b.o_custkey)) AS m) l;
 SELECT pg_temp.same('rw', 'hw') AS two_entities;
 DROP TABLE rw, hw;
+-- the definition: world j counts 2 x 2 x the pairs whose two customers are both in world j
+CREATE TEMP TABLE rw AS SELECT count(*) AS n
+FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_custkey < b.o_custkey;
+SELECT count(*) FILTER (WHERE r.v <> d.n) AS worlds_differing
+FROM (SELECT ordinality - 1 AS j, v FROM rw, unnest(rw.n) WITH ORDINALITY u(v, ordinality)) r
+JOIN (SELECT j, 4 * count(*) AS n
+      FROM r_orders a JOIN r_orders b ON a.o_total = b.o_total AND a.o_custkey < b.o_custkey,
+           generate_series(0, 63) j
+      WHERE (priv_hash(asa_hash(a.o_custkey)) >> j) & 1 = 1 AND (priv_hash(asa_hash(b.o_custkey)) >> j) & 1 = 1
+      GROUP BY j) d USING (j);
+DROP TABLE rw;
+-- keys equal by a join condition are one entity: one mask, no correction
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT count(*) FROM r_orders a JOIN r_orders b ON a.o_custkey = b.o_custkey AND a.o_orderkey < b.o_orderkey;
+-- ... also when a subquery exposes the key it derives its mask from ...
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT c_nation, count(*) FROM (SELECT o_custkey, o_total FROM r_orders WHERE o_total > 10) o
+JOIN r_customer ON c_custkey = o.o_custkey GROUP BY 1;
+CREATE TEMP TABLE rw AS SELECT c_nation, count(*) AS n FROM (SELECT o_custkey, o_total FROM r_orders WHERE o_total > 10) o
+JOIN r_customer ON c_custkey = o.o_custkey GROUP BY 1;
+CREATE TEMP TABLE hw AS SELECT c_nation, as_count(priv_hash(asa_hash(c_custkey))) AS n
+FROM r_orders JOIN r_customer ON c_custkey = o_custkey WHERE o_total > 10 GROUP BY 1;
+SELECT pg_temp.same('rw', 'hw') AS exposed_key;
+DROP TABLE rw, hw;
+-- ... but a subquery's entity without an exposed key counts as one more
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT count(*) FROM (SELECT o_total FROM r_orders) o JOIN r_customer ON c_custkey = o.o_total;
 
 -- FILTER is kept; ORDER BY / DISTINCT on a rewritten column sort the arrays
 CREATE TEMP TABLE rw AS SELECT c_nation, count(*) FILTER (WHERE c_custkey > 100) AS n FROM r_customer GROUP BY 1;
@@ -177,7 +207,7 @@ SELECT o_custkey FROM r_orders WHERE o_orderkey IN (SELECT l_orderkey FROM r_lin
 SELECT c_nation FROM r_customer GROUP BY 1 HAVING sum(c_custkey) > 10;
 SELECT sum(o_total) > 10 FROM r_orders;
 SELECT round(sum(o_total)) FROM r_orders;
-SELECT count(DISTINCT o_custkey) FROM r_orders;
+SELECT sum(o_total ORDER BY o_total) FROM r_orders;
 SELECT min(l_ship) FROM r_lineitem;
 SELECT string_agg(n_name, ',') FROM r_customer JOIN r_nation ON n_key = c_nation;
 SELECT max(s) FROM (SELECT o_custkey, sum(o_total) AS s FROM r_orders GROUP BY 1) t;
