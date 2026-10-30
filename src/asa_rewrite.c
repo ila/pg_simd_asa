@@ -2204,7 +2204,7 @@ asa_rewrite_query(ParseState *pstate, Query *query)
 	asa_reject_udfs_walker((Node *) query, &extension);
 	if (asa_uses_extension_walker((Node *) query, &extension))
 		return;
-	st.query_hash = asa_statement_query_hash(asa_noise_active() && !st.counters);
+	st.query_hash = asa_seed_query_hash();
 	asa_level(&st, query, ASA_TOP, false, false);
 }
 

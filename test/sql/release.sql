@@ -16,12 +16,6 @@ INSERT INTO p_customer SELECT c, c % 5, (c % 37) * 2.5 FROM generate_series(1, 3
 INSERT INTO p_orders SELECT o, o % 300 + 1, o % 97 FROM generate_series(1, 1500) o;
 INSERT INTO p_lineitem SELECT l % 1500 + 1, l % 50 + 1, (l % 13) * 1.5 FROM generate_series(1, 6000) l;
 INSERT INTO p_nation SELECT n, 'nation ' || n FROM generate_series(0, 9) n;
--- autovacuum would invalidate the prepared statement below at random: its re-analysis
--- draws the next per-statement nonce, and later statements other noise
-ALTER TABLE p_customer SET (autovacuum_enabled = off);
-ALTER TABLE p_orders SET (autovacuum_enabled = off);
-ALTER TABLE p_lineitem SET (autovacuum_enabled = off);
-ALTER TABLE p_nation SET (autovacuum_enabled = off);
 SELECT asa_add_entity('p_customer', 'c_custkey');
 SELECT asa_add_link('p_orders', 'o_custkey', 'p_customer', 'c_custkey');
 SELECT asa_add_link('p_lineitem', 'l_orderkey', 'p_orders', 'o_orderkey');
@@ -36,7 +30,7 @@ BEGIN
 END
 $$;
 
--- the hand-written queries: masks without a per-statement nonce (noise off)
+-- the hand-written queries: the same masks as the rewrite (both from the seed)
 CREATE TEMP VIEW c AS SELECT *, priv_hash(asa_hash(c_custkey)) AS m FROM p_customer;
 CREATE TEMP VIEW o AS SELECT *, priv_hash(asa_hash(o_custkey)) AS m FROM p_orders;
 CREATE TEMP VIEW l AS SELECT p_lineitem.*, priv_hash(asa_hash(o_custkey)) AS m
@@ -192,8 +186,8 @@ RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 
--- with noise every statement draws fresh worlds; re-executing a prepared statement releases
--- the same values (its generators and p-tracking restart)
+-- with noise the worlds and noise come from the seed alone: a statement, prepared or not,
+-- releases the same values every time it runs
 SET simd_asa.noise = on;
 SET simd_asa.seed = 11;
 PREPARE q AS SELECT c_nation, sum(c_custkey) AS s FROM p_customer GROUP BY 1;

@@ -115,7 +115,6 @@ extern void asa_noise_init(void);
  */
 extern uint64 asa_query_hash_from_seed(uint64 seed);
 extern uint64 asa_seed_query_hash(void);
-extern uint64 asa_statement_query_hash(bool noise);
 
 /* Builds a 64-element real[] without NULLs. */
 extern ArrayType *asa_make_array(const asa_float *vals);

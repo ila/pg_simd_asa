@@ -108,13 +108,14 @@ aggregate returns (`count` → `bigint`, `sum(integer)` → `bigint`, `sum(numer
 | `simd_asa.mi` | 1/128 | mutual-information bound (`pac_mi`); lower = more noise; 0 = no noise |
 | `simd_asa.ptracking` | `on` | p-tracking (`pac_ptracking`) |
 | `simd_asa.sample_diversity_check` | `on` | reject noised aggregates whose groups mostly hold a single entity (`pac_sample_diversity_check`) |
-| `simd_asa.seed` | 42 | with noise, the rewrite mixes a per-statement nonce into the seed: a counter if the seed was set (reproducible), else a random value |
+| `simd_asa.seed` | 42 | seed of the worlds and the noise: a statement releases the same values whenever it runs on the same data with the same seed |
 
-Randomness comes from a per-statement generator seeded by the query hash; it and the
-p-tracking posterior restart when a top-level statement starts, so re-executing a prepared
-statement releases the same values instead of fresh noise that could be averaged out. (When
-PostgreSQL re-analyzes a prepared statement, after DDL or new statistics on its tables, the
-rewrite runs again and draws a new nonce.)
+Every statement's query hash is the seed's. Randomness comes from a per-statement generator
+seeded by it; the generator and the p-tracking posterior restart when a top-level statement
+starts. So a statement releases the same values every time it runs on the same data with the
+same plan. A different plan can differ: cells draw in the order they are finalized, and parallel
+workers combine floating-point partial sums in the order they finish (use
+`max_parallel_workers_per_gather = 0` for repeatable runs).
 
 ## Automatic rewrite
 
@@ -385,10 +386,12 @@ Deviations from the DuckDB code:
   `DECIMAL`; the noised forms use the integer path, as DuckDB's fused `as_noised_sum`.
 - A correlated sub-select over no rows returns NULL counters (`asa_counters_*`), as DuckDB's
   decorrelated sub-selects do; `as_sum` itself returns 64 zeros there, as DuckDB's.
-- The noise generator is PostgreSQL's (`pg_prng`), not `std::mt19937_64`: noised values are
-  distributed as in DuckDB, not identical to them. Every cell of a statement draws from one
-  generator (DuckDB reseeds per vector of groups), and without an explicit seed the
-  per-statement nonce is random (DuckDB: the query id).
+- The noise generator is PostgreSQL's (`pg_prng`), not DuckDB's PCG32 streams: noised values
+  are distributed as in DuckDB, not identical to them. Every cell of a statement draws from one
+  generator, in the order the cells are finalized (DuckDB: a stream per finalized batch). Both
+  repeat exactly only serially (`max_parallel_workers_per_gather = 0`, DuckDB `threads = 1`).
+  The query hash is always the seed's, as DuckDB's with an explicit `privacy_seed` (without one,
+  DuckDB mixes in the query id).
 - `DISTINCT` aggregates sort their input by the value (an ordered aggregate, as PostgreSQL's
   own `count(DISTINCT)`) instead of pre-aggregating with `bit_or`; the values each feed the
   base aggregate once with their OR-ed mask, so the releases are DuckDB's. Like
