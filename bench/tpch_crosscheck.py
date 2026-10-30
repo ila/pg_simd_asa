@@ -12,7 +12,7 @@ return what DuckDB's privacy extension returns:
     which its compiler rejects (columns of the privacy unit outside aggregates). Q22 has a
     predicate over worlds, for which DuckDB's compiler releases through counter lists and
     as_noised (as its plan for Q17 shows): its reference is the hand-written query in that
-    form (hand_q22_categorical.sql, out_q22_categorical.csv).
+    form (bench/duckdb/q22_categorical.sql, out_q22_categorical.csv).
 
 Q2, Q11 and Q16 read no entity-dependent relation: both systems run them unchanged.
 
