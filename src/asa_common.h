@@ -18,6 +18,11 @@
 #include "fmgr.h"
 #include "utils/array.h"
 
+/* pg_prng_double_normal (noise) and the range-table permission model (rewrite) */
+#if PG_VERSION_NUM < 160000
+#error "simd_asa requires PostgreSQL 16 or later"
+#endif
+
 #define ASA_LANES 64
 
 /* Output element type: PostgreSQL real (float4), as LIST<FLOAT> in DuckDB. */
@@ -54,6 +59,44 @@ asa_clzll(uint64 x)
 /* Reads a bigint mask argument as uint64 (bit pattern preserved). */
 #define ASA_GETARG_MASK(n) ((uint64) PG_GETARG_INT64(n))
 
+/*
+ * Release parameters of the asa_* forms, given as their two last arguments and stored in
+ * the state by their transition functions (zero: not set).
+ *   query_hash: the statement's query hash.
+ *   correction: 2^(k-1) for rows derived from k entities, whose masks are AND-ed: such a
+ *               row is in a world with probability 2^-k, not 1/2 (DuckDB's correction).
+ */
+typedef struct AsaReleaseParams
+{
+	uint64		query_hash;
+	double		correction;
+} AsaReleaseParams;
+
+static inline double
+asa_correction(const AsaReleaseParams *rel)
+{
+	return rel && rel->correction > 0 ? rel->correction : 1.0;
+}
+
+/* Keeps dst's parameters, or takes src's when dst has none (combine functions). */
+static inline void
+asa_release_params_merge(AsaReleaseParams *dst, const AsaReleaseParams *src)
+{
+	if (!dst->query_hash && dst->correction == 0)
+		*dst = *src;
+}
+
+/* Multiplies 2x-scaled world counters of count and sum by the correction. */
+static inline void
+asa_correct_counters(asa_float *counters, const AsaReleaseParams *rel)
+{
+	double		c = asa_correction(rel);
+
+	if (c != 1.0)
+		for (int j = 0; j < ASA_LANES; j++)
+			counters[j] = (asa_float) (counters[j] * c);
+}
+
 /* Returns the aggregate memory context, erroring when not called as an aggregate. */
 static inline MemoryContext
 asa_agg_context(FunctionCallInfo fcinfo, const char *fname)
@@ -77,7 +120,6 @@ extern void asa_noise_init(void);
  */
 extern uint64 asa_query_hash_from_seed(uint64 seed);
 extern uint64 asa_seed_query_hash(void);
-extern uint64 asa_statement_query_hash(bool noise);
 
 /* Builds a 64-element real[] without NULLs. */
 extern ArrayType *asa_make_array(const asa_float *vals);

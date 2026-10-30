@@ -10,15 +10,15 @@
 extern bool asa_noise_active(void);
 
 /*
- * Query hash of a noised aggregate: for the rewrite's asa_noised_* forms (from_arg) the
- * last argument, which their transition functions store in the state; else derived from
- * simd_asa.seed.
+ * Release parameters of a noised aggregate: for the rewrite's asa_noised_* forms (from_arg)
+ * those their transition functions stored in the state; else the query hash derived from
+ * simd_asa.seed and correction 1.
  */
-extern uint64 asa_agg_query_hash(bool from_arg, uint64 state_query_hash);
+extern AsaReleaseParams asa_agg_release_params(bool from_arg, const AsaReleaseParams *state);
 
 /*
- * Transition function of an asa_* form: the base transition, then the query hash (argument
- * QARG) stored in the state's FIELD.
+ * Transition function of an asa_* form: the base transition, then the release parameters
+ * (arguments QARG, QARG + 1) stored in the state's FIELD.
  */
 #define ASA_DEFINE_QTRANS(NAME, BASE, STATE, FIELD, QARG) \
 	PG_FUNCTION_INFO_V1(NAME); \
@@ -27,7 +27,11 @@ extern uint64 asa_agg_query_hash(bool from_arg, uint64 state_query_hash);
 	{ \
 		Datum		result = BASE(fcinfo); \
 		if (!fcinfo->isnull) \
-			((STATE *) DatumGetPointer(result))->FIELD = (uint64) PG_GETARG_INT64(QARG); \
+		{ \
+			STATE	   *s = (STATE *) DatumGetPointer(result); \
+			s->FIELD.query_hash = (uint64) PG_GETARG_INT64(QARG); \
+			s->FIELD.correction = PG_GETARG_FLOAT8((QARG) + 1); \
+		} \
 		return result; \
 	}
 
@@ -35,11 +39,13 @@ extern uint64 asa_agg_query_hash(bool from_arg, uint64 state_query_hash);
  * Releases one value of a noised aggregate from its 64 world counters (2x-scaled, as the
  * as_* aggregates return them). key_hash: the worlds that received a row; update_count:
  * the rows aggregated. slot distinguishes the releases of one aggregate call (as_noised_avg
- * releases a sum and a count) for the sample-diversity check. Returns false for a NULL
- * release.
+ * releases a sum and a count) for the sample-diversity check. The correction of rel makes
+ * the cell less likely NULL and, with scale (count, sum, avg: not min/max), multiplies
+ * the counters. Returns false for a NULL release.
  */
 extern bool asa_release(FunctionCallInfo fcinfo, int slot, const asa_float *counters, uint64 key_hash,
-						uint64 update_count, uint64 query_hash, const char *name, double *out);
+						uint64 update_count, const AsaReleaseParams *rel, bool scale, const char *name,
+						double *out);
 
 /* Converts a released value to the result type of the calling function. */
 extern Datum asa_release_datum(FunctionCallInfo fcinfo, double value);

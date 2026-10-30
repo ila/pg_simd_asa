@@ -30,7 +30,7 @@ BEGIN
 END
 $$;
 
--- the hand-written queries: masks without a per-statement nonce (noise off)
+-- the hand-written queries: the same masks as the rewrite (both from the seed)
 CREATE TEMP VIEW c AS SELECT *, priv_hash(asa_hash(c_custkey)) AS m FROM p_customer;
 CREATE TEMP VIEW o AS SELECT *, priv_hash(asa_hash(o_custkey)) AS m FROM p_orders;
 CREATE TEMP VIEW l AS SELECT p_lineitem.*, priv_hash(asa_hash(o_custkey)) AS m
@@ -186,8 +186,8 @@ RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 
--- with noise every statement draws fresh worlds; re-executing a prepared statement releases
--- the same values (its generators and p-tracking restart)
+-- with noise the worlds and noise come from the seed alone: a statement, prepared or not,
+-- releases the same values every time it runs
 SET simd_asa.noise = on;
 SET simd_asa.seed = 11;
 PREPARE q AS SELECT c_nation, sum(c_custkey) AS s FROM p_customer GROUP BY 1;

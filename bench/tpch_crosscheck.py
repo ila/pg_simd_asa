@@ -12,9 +12,17 @@ return what DuckDB's privacy extension returns:
     which its compiler rejects (columns of the privacy unit outside aggregates). Q22 has a
     predicate over worlds, for which DuckDB's compiler releases through counter lists and
     as_noised (as its plan for Q17 shows): its reference is the hand-written query in that
-    form (hand_q22_categorical.sql, out_q22_categorical.csv).
+    form (bench/duckdb/q22_categorical.sql, out_q22_categorical.csv).
 
 Q2, Q11 and Q16 read no entity-dependent relation: both systems run them unchanged.
+
+D1-D4 (bench/tpch_distinct) are count/sum/avg(DISTINCT ...) over TPC-H, checked against
+DuckDB's automatic rewrite (its bit_or pre-aggregation of the distinct values).
+
+C1 checks the correction for rows of two customers, which has no DuckDB reference (DuckDB
+derives one hash per privacy-unit table, so its self-joins mask by one of the two customers):
+pairs of orders of two different customers, whose masks are AND-ed, are in world 0 with
+probability 1/4, and the corrected counts must be within 2% of the exact ones.
 
 Q15 has no DuckDB reference: DuckDB's rewrite of its CTE releases different values
 depending on how the CTE is consumed (per supplier, under max(), under ORDER BY ... LIMIT),
@@ -99,6 +107,19 @@ def compare(pg, duck):
     return None
 
 
+SELF_JOIN = """SELECT a.o_orderpriority, count(*) FROM orders a JOIN orders b
+ON a.o_clerk = b.o_clerk AND a.o_orderdate = b.o_orderdate AND a.o_custkey < b.o_custkey GROUP BY 1 ORDER BY 1"""
+
+
+def check_correction():
+    released = run_pg(SELF_JOIN)
+    exact = run_pg(SELF_JOIN, "SET simd_asa.rewrite = off;\n")
+    for r, e in zip(released[1:], exact[1:]):
+        if r[0] != e[0] or abs(float(r[1]) - float(e[1])) > 0.02 * float(e[1]):
+            return f"{r} vs exact {e}"
+    return None if len(released) == len(exact) else f"{len(released) - 1} rows vs {len(exact) - 1}"
+
+
 failures = 0
 for n in range(1, 23):
     with open(os.path.join(HERE, "tpch_queries", f"q{n:02d}.sql")) as f:
@@ -107,4 +128,14 @@ for n in range(1, 23):
     result = check_q15(pg) if n == 15 else compare(pg, read_oracle(n))
     failures += result is not None
     print(f"Q{n:02d}: {'ok' if result is None else 'MISMATCH ' + result}")
+for n in range(1, 5):
+    with open(os.path.join(HERE, "tpch_distinct", f"d{n}.sql")) as f:
+        query = f.read()
+    with open(os.path.join(ORACLE, f"out_d{n}.csv")) as f:
+        result = compare(run_pg(query), list(csv.reader(f)))
+    failures += result is not None
+    print(f"D{n}: {'ok' if result is None else 'MISMATCH ' + result}")
+result = check_correction()
+failures += result is not None
+print(f"C1: {'ok' if result is None else 'MISMATCH ' + result}")
 sys.exit(1 if failures else 0)

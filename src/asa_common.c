@@ -23,50 +23,25 @@ PG_MODULE_MAGIC;
 #define ASA_HASH_PRIME UINT64CONST(0xB2833106536E95DF)
 
 static int	asa_seed = 42;
-static bool asa_seed_explicit = false;	/* simd_asa.seed was set, not left at its default */
 static bool asa_hash_repair = false;	/* DuckDB's pac_hash_repair also defaults to false */
 
 void		_PG_init(void);
-
-/* Records whether the seed comes from the default, through the check hook's extra. */
-static bool
-asa_seed_check(int *newval, void **extra, GucSource source)
-{
-	bool	   *is_explicit = (bool *) guc_malloc(LOG, sizeof(bool));
-
-	if (!is_explicit)
-		return false;
-	*is_explicit = source > PGC_S_DEFAULT;
-	*extra = is_explicit;
-	return true;
-}
-
-static void
-asa_seed_assign(int newval, void *extra)
-{
-	asa_seed_explicit = extra && *(bool *) extra;
-}
 
 void
 _PG_init(void)
 {
 	DefineCustomIntVariable("simd_asa.seed",
 							"Seed of the membership masks and of the noise.",
-							"Changing the seed draws a fresh assignment of sampling entities to worlds. With noise, "
-							"every statement also mixes in a fresh nonce: a counter if the seed is set (reproducible), "
-							"else a random value.",
-							&asa_seed, 42, INT_MIN, INT_MAX, PGC_USERSET, 0, asa_seed_check, asa_seed_assign, NULL);
+							"Every statement derives its worlds and noise from the seed alone, so a statement "
+							"releases the same values whenever it runs on the same data with the same seed.",
+							&asa_seed, 42, INT_MIN, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("simd_asa.hash_repair",
 							 "Repair priv_hash() masks to exactly 32 set bits.",
 							 "Every sampling entity then belongs to exactly half of the 64 worlds.",
 							 &asa_hash_repair, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	asa_noise_init();			/* noise settings and executor hooks */
 	asa_rewrite_init();			/* defines simd_asa.rewrite / simd_asa.entity: before reserving */
-#if PG_VERSION_NUM >= 150000
 	MarkGUCPrefixReserved("simd_asa");
-#else
-	EmitWarningsOnPlaceholders("simd_asa");
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -236,33 +211,11 @@ asa_query_hash_from_seed(uint64 seed)
 	return (seed * ASA_MAGIC_HASH) ^ ASA_MAGIC_HASH;
 }
 
-/* Query hash without a per-statement nonce: what DuckDB uses with pac_mi = 0. */
+/* Query hash of every statement: the seed's (DuckDB's with an explicit privacy_seed). */
 uint64
 asa_seed_query_hash(void)
 {
 	return asa_query_hash_from_seed((uint64) (int64) asa_seed);
-}
-
-/*
- * Query hash of a rewritten statement. Without noise it is the seed's (deterministic, as
- * DuckDB with pac_mi = 0); with noise a per-statement nonce is mixed in (DuckDB mixes in the
- * query id), so that every statement draws fresh worlds and noise: a counter when the seed
- * was set (reproducible runs), otherwise a random value.
- */
-uint64
-asa_statement_query_hash(bool noise)
-{
-	static uint64 statement_counter = 0;
-	uint64		seed = (uint64) (int64) asa_seed;
-	uint64		nonce;
-
-	if (noise)
-	{
-		if (asa_seed_explicit || !pg_strong_random(&nonce, sizeof(nonce)))
-			nonce = ++statement_counter;
-		seed ^= ASA_MAGIC_HASH * nonce;
-	}
-	return asa_query_hash_from_seed(seed);
 }
 
 static inline int64

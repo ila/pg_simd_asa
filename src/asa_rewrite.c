@@ -11,11 +11,13 @@
  *      level already contains, through an injected join, or directly when the link points
  *      at the entity; the level's row mask is the AND over the distinct keys of
  *      priv_hash(asa_hash(key), query_hash): a row belongs to world j iff every entity it
- *      derives from does.
+ *      derives from does. A row of k distinct entities is thus in a world with probability
+ *      2^-k, and the aggregates multiply by the correction 2^(k-1) (DuckDB's correction).
  *   2. Aggregates over dependent rows are released: sum/count/avg/min/max become noised
  *      PAC aggregates (asa_noised_*) of the original result type. An arithmetic expression
  *      over several aggregates is evaluated per world (asa_lane_*) and released once
- *      (asa_noised); other expressions apply to the released values. With
+ *      (asa_noised); other expressions apply to the released values. count/sum/avg(DISTINCT)
+ *      become asa_*_distinct, ordered by their value (asa_distinct.c). With
  *      simd_asa.counters = on, aggregates return their 64 world counters (real[]) instead.
  *   3. A FROM-clause subquery that does not aggregate passes its row mask up as an extra
  *      column, so the aggregates above use it (TPC-H Q7, Q8, Q9, Q22). One that aggregates
@@ -37,6 +39,8 @@
  * unrewritten.
  */
 #include "postgres.h"
+
+#include <math.h>
 
 #include "access/table.h"
 #include "catalog/dependency.h"
@@ -68,8 +72,6 @@
 
 #include "asa_common.h"
 #include "asa_noise.h"
-
-#if PG_VERSION_NUM >= 160000
 
 #define ASA_MAX_LINK_DEPTH 32
 #define ASA_MAX_INJECTED_JOINS 64
@@ -280,6 +282,10 @@ typedef struct AsaCtx
 	int			injected;
 	List	   *lane_sublinks;	/* SubLink *: predicate sub-selects returning world counters */
 	bool		categorical;	/* the mask holds predicates over worlds: release via counters */
+	List	   *child_keys;		/* Var *: entity keys FROM-clause subqueries expose with their mask */
+	int			hidden_entities;	/* entities of their masks without an exposed key */
+	List	   *key_classes;	/* List * of Var *: the distinct entity keys of the row mask */
+	int			entities;		/* distinct entities AND-ed into the row mask (k) */
 } AsaCtx;
 
 typedef enum AsaKind
@@ -296,6 +302,8 @@ typedef struct AsaLevelResult
 	bool		rewritten;		/* its aggregates were rewritten (released or counters) */
 	AttrNumber	mask_attno;		/* output column passing the row mask up, 0 if none */
 	bool		categorical;	/* that mask holds predicates over worlds */
+	int			entities;		/* distinct entities AND-ed into that mask */
+	List	   *key_attnos;		/* output columns holding the key of one of them */
 } AsaLevelResult;
 
 /* ---------------------------------------------------------------------------
@@ -672,6 +680,19 @@ asa_query_hash_const(AsaCtx *ctx)
 					 FLOAT8PASSBYVAL);
 }
 
+/* 2^(k-1) for a row mask of k distinct entities (1 for one, or for predicates alone). */
+static double
+asa_correction_factor(AsaCtx *ctx)
+{
+	return ctx->entities > 1 ? ldexp(1.0, ctx->entities - 1) : 1.0;
+}
+
+static Const *
+asa_float8_const(double value)
+{
+	return makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8), Float8GetDatum(value), false, FLOAT8PASSBYVAL);
+}
+
 /* priv_hash(asa_hash(key), query_hash); smallint keys hash like integers (as DuckDB's hash()). */
 static Expr *
 asa_key_mask(AsaCtx *ctx, Expr *key)
@@ -715,12 +736,17 @@ asa_supported_value_type(Oid type)
 typedef enum AsaAggForm
 {
 	ASA_AGG_COUNTERS,			/* as_*(mask [, value]): world counters */
-	ASA_AGG_QCOUNTERS,			/* asa_counters_*(mask [, value], query_hash): the same, sharing ... */
-	ASA_AGG_NOISED				/* ... the transition state of asa_noised_*(...): PAC release */
+	ASA_AGG_QCOUNTERS,			/* asa_counters_*(mask [, value], query_hash, correction): the same, ... */
+	ASA_AGG_NOISED				/* ... sharing the transition state of asa_noised_*(...): PAC release */
 } AsaAggForm;
 
-/* The stochastic counterpart of agg over rows with membership mask. */
-static Aggref *
+/*
+ * The stochastic counterpart of agg over rows with membership mask: an aggregate, or for
+ * the as_* counters of a mask of several entities, the aggregate times the correction.
+ * count/sum/avg(DISTINCT v) become asa_*_distinct(... ORDER BY v), of the asa_* forms,
+ * without correction.
+ */
+static Expr *
 asa_make_aggref(AsaCtx *ctx, Aggref *agg, Expr *mask, AsaAggForm form)
 {
 	char	   *name = get_func_name(agg->aggfnoid);
@@ -729,8 +755,10 @@ asa_make_aggref(AsaCtx *ctx, Aggref *agg, Expr *mask, AsaAggForm form)
 	char		fname[NAMEDATALEN];
 	List	   *args = list_make1(makeTargetEntry((Expr *) copyObject(mask), 1, NULL, false));
 	List	   *types = list_make1_oid(INT8OID);
-	Oid			argtypes[3] = {INT8OID, InvalidOid, InvalidOid};
+	Oid			argtypes[4] = {INT8OID, InvalidOid, InvalidOid, InvalidOid};
 	int			nargs = 1;
+	bool		distinct;
+	double		correction;
 	Aggref	   *out;
 	Oid			fn;
 
@@ -742,12 +770,16 @@ asa_make_aggref(AsaCtx *ctx, Aggref *agg, Expr *mask, AsaAggForm form)
 		ASA_UNSUPPORTED("aggregate %s has no stochastic counterpart", format_procedure(agg->aggfnoid));
 	if (agg->aggkind != AGGKIND_NORMAL || agg->agglevelsup != 0 || agg->aggdirectargs)
 		ASA_UNSUPPORTED("ordered-set and outer-level aggregates are not supported");
-	if (agg->aggdistinct)
-		ASA_UNSUPPORTED("%s(DISTINCT ...) is not supported", name);
 	if (agg->aggorder)
 		ASA_UNSUPPORTED("ORDER BY inside %s(...) is not supported", name);
+	/* min/max(DISTINCT v) = min/max(v) */
+	distinct = agg->aggdistinct != NIL && strcmp(base, "min") != 0 && strcmp(base, "max") != 0;
+	if (distinct && form == ASA_AGG_COUNTERS)
+		form = ASA_AGG_QCOUNTERS;	/* the as_* aggregates have no DISTINCT form */
+	/* as DuckDB's DISTINCT pre-aggregation, whose OR-ed masks take no correction */
+	correction = distinct ? 1.0 : asa_correction_factor(ctx);
 	snprintf(fname, sizeof(fname), form == ASA_AGG_COUNTERS ? "as_%s" : form == ASA_AGG_QCOUNTERS ?
-			 "asa_counters_%s" : "asa_noised_%s", base);
+			 "asa_counters_%s%s" : "asa_noised_%s%s", base, distinct ? "_distinct" : "");
 
 	if (!agg->aggstar)
 	{
@@ -774,6 +806,9 @@ asa_make_aggref(AsaCtx *ctx, Aggref *agg, Expr *mask, AsaAggForm form)
 		argtypes[nargs++] = INT8OID;
 		args = lappend(args, makeTargetEntry((Expr *) asa_query_hash_const(ctx), nargs, NULL, false));
 		types = lappend_oid(types, INT8OID);
+		argtypes[nargs++] = FLOAT8OID;
+		args = lappend(args, makeTargetEntry((Expr *) asa_float8_const(correction), nargs, NULL, false));
+		types = lappend_oid(types, FLOAT8OID);
 	}
 	fn = asa_func(ctx, fname, nargs, argtypes);
 
@@ -782,6 +817,14 @@ asa_make_aggref(AsaCtx *ctx, Aggref *agg, Expr *mask, AsaAggForm form)
 	out->args = args;
 	out->aggargtypes = types;
 	out->aggstar = false;
+	if (agg->aggdistinct)
+	{
+		/* the value keeps its ressortgroupref: the DISTINCT clause becomes the input order */
+		out->aggorder = distinct ? agg->aggdistinct : NIL;
+		out->aggdistinct = NIL;
+		if (!distinct)
+			((TargetEntry *) lsecond(args))->ressortgroupref = 0;
+	}
 	if (form == ASA_AGG_NOISED)
 	{
 		if (get_func_rettype(fn) != agg->aggtype)
@@ -795,7 +838,15 @@ asa_make_aggref(AsaCtx *ctx, Aggref *agg, Expr *mask, AsaAggForm form)
 	}
 	out->aggtranstype = InvalidOid;
 	out->aggsplit = AGGSPLIT_SIMPLE;
-	return out;
+	if (form == ASA_AGG_COUNTERS && correction != 1.0 && (strcmp(base, "count") == 0 || strcmp(base, "sum") == 0))
+	{
+		Oid			mul_args[2] = {FLOAT4ARRAYOID, FLOAT8OID};
+
+		return (Expr *) makeFuncExpr(asa_func(ctx, "asa_lane_mul", 2, mul_args), FLOAT4ARRAYOID,
+									 list_make2(out, asa_float8_const(correction)), InvalidOid, InvalidOid,
+									 COERCE_EXPLICIT_CALL);
+	}
+	return (Expr *) out;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1765,11 +1816,23 @@ asa_level_children(AsaCtx *ctx, bool below, bool grouped)
 
 			if (r.mask_attno)
 			{
+				ListCell   *lck;
+
 				if (bms_is_member(rtindex, ctx->nullable))
 					ASA_UNSUPPORTED("an entity-dependent subquery on the nullable side of an outer join is not supported");
 				rte->eref->colnames = lappend(rte->eref->colnames, makeString(pstrdup("asa_mask")));
 				masks = lappend(masks, makeVar(rtindex, r.mask_attno, INT8OID, -1, InvalidOid, 0));
 				ctx->categorical |= r.categorical;
+				foreach(lck, r.key_attnos)
+				{
+					TargetEntry *tle = get_tle_by_resno(rte->subquery->targetList, lfirst_int(lck));
+
+					ctx->child_keys = lappend(ctx->child_keys,
+											  makeVar(rtindex, tle->resno, exprType((Node *) tle->expr),
+													  exprTypmod((Node *) tle->expr),
+													  exprCollation((Node *) tle->expr), 0));
+				}
+				ctx->hidden_entities += r.entities - list_length(r.key_attnos);
 			}
 		}
 		else if (below && rte->rtekind == RTE_CTE)
@@ -1819,11 +1882,63 @@ asa_level_sublinks(AsaCtx *ctx)
 	asa_sublinks_walker(ctx->query->limitOffset, ctx);
 }
 
-/* Masks of the level's own entity-dependent relations (one per distinct entity key). */
+/* Whether keys a and b hold the same value in every row: equal, or joined by equalities. */
+static bool
+asa_same_key(AsaCtx *ctx, Var *a, Var *b)
+{
+	List	   *reached = list_make1(a);
+	ListCell   *lc;
+
+	if (exprType((Node *) a) != exprType((Node *) b))
+		return false;			/* hashed differently */
+	foreach(lc, reached)		/* breadth-first over the equality conjuncts */
+	{
+		Var		   *v = (Var *) lfirst(lc);
+		ListCell   *le;
+
+		if (asa_var_is(v, b->varno, b->varattno))
+			return true;
+		foreach(le, ctx->eqs)
+		{
+			AsaEq	   *eq = (AsaEq *) lfirst(le);
+			Var		   *other = asa_var_is(eq->a, v->varno, v->varattno) ? eq->b :
+				asa_var_is(eq->b, v->varno, v->varattno) ? eq->a : NULL;
+			ListCell   *lr;
+			bool		seen = false;
+
+			if (!other || exprType((Node *) other) != exprType((Node *) a))
+				continue;
+			foreach(lr, reached)
+				seen |= asa_var_is((Var *) lfirst(lr), other->varno, other->varattno);
+			if (!seen)
+				reached = lappend(reached, other);
+		}
+	}
+	return false;
+}
+
+static bool
+asa_key_in_class(AsaCtx *ctx, Var *key, List *class)
+{
+	ListCell   *lc;
+
+	foreach(lc, class)
+		if (asa_same_key(ctx, key, (Var *) lfirst(lc)))
+			return true;
+	return false;
+}
+
+/*
+ * Masks of the level's own entity-dependent relations: one per distinct entity key. Keys
+ * joined by equalities are one entity (orders a JOIN orders b ON a.o_custkey = b.o_custkey),
+ * and a key a FROM-clause subquery exposes adds no mask (the subquery's mask holds it).
+ * Sets ctx->entities, k of the correction: the distinct keys and the subqueries' entities
+ * without an exposed key.
+ */
 static List *
 asa_level_key_masks(AsaCtx *ctx)
 {
-	List	   *keys = NIL;
+	List	   *keys = list_copy(ctx->child_keys);	/* first: classes holding one start with it */
 	List	   *masks = NIL;
 	int			n = list_length(ctx->query->rtable);
 	ListCell   *lc;
@@ -1831,20 +1946,61 @@ asa_level_key_masks(AsaCtx *ctx)
 	for (int rtindex = 1; rtindex <= n; rtindex++)
 	{
 		RangeTblEntry *rte = rt_fetch(rtindex, ctx->query->rtable);
-		Expr	   *key;
 
 		if (rte->rtekind != RTE_RELATION || rte->relkind == RELKIND_VIEW || !asa_is_dependent(ctx->meta, rte->relid))
 			continue;
 		if (bms_is_member(rtindex, ctx->nullable))
 			ASA_UNSUPPORTED("entity-dependent relation \"%s\" is on the nullable side of an outer join",
 							get_rel_name(rte->relid));
-		key = asa_entity_key(ctx, rtindex, 0);
-		if (!list_member(keys, key))
-			keys = lappend(keys, key);
+		keys = lappend(keys, asa_entity_key(ctx, rtindex, 0));
 	}
 	foreach(lc, keys)
-		masks = lappend(masks, asa_key_mask(ctx, (Expr *) lfirst(lc)));
+	{
+		Var		   *key = (Var *) lfirst(lc);
+		ListCell   *lcc;
+		bool		found = false;
+
+		foreach(lcc, ctx->key_classes)
+			if (asa_key_in_class(ctx, key, (List *) lfirst(lcc)))
+			{
+				lfirst(lcc) = lappend((List *) lfirst(lcc), key);
+				found = true;
+				break;
+			}
+		if (!found)
+			ctx->key_classes = lappend(ctx->key_classes, list_make1(key));
+	}
+	foreach(lc, ctx->key_classes)
+		if (!list_member_ptr(ctx->child_keys, linitial((List *) lfirst(lc))))
+			masks = lappend(masks, asa_key_mask(ctx, (Expr *) linitial((List *) lfirst(lc))));
+	ctx->entities = list_length(ctx->key_classes) + ctx->hidden_entities;
 	return masks;
+}
+
+/* Output columns holding a key of the row mask's entities (one per entity that has one). */
+static List *
+asa_visible_keys(AsaCtx *ctx)
+{
+	List	   *attnos = NIL;
+	ListCell   *lc;
+
+	foreach(lc, ctx->key_classes)
+	{
+		ListCell   *lt;
+
+		foreach(lt, ctx->query->targetList)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lt);
+			Var		   *var = asa_strip_var((Node *) tle->expr);
+
+			if (!tle->resjunk && var && asa_key_in_class(ctx, var, (List *) lfirst(lc)))
+			{
+				attnos = lappend_int(attnos, tle->resno);
+				break;
+			}
+		}
+	}
+	return attnos;
 }
 
 /*
@@ -1858,7 +2014,7 @@ asa_level_key_masks(AsaCtx *ctx)
 static AsaLevelResult
 asa_level(AsaStmt *st, Query *query, AsaKind kind, bool consumed, bool consumer_grouped)
 {
-	AsaLevelResult result = {false, 0};
+	AsaLevelResult result = {0};
 	AsaCtx		ctx;
 	bool		aggregating = query->hasAggs || query->groupClause != NIL || query->groupingSets != NIL;
 	bool		below;
@@ -1890,6 +2046,9 @@ asa_level(AsaStmt *st, Query *query, AsaKind kind, bool consumed, bool consumer_
 		{
 			if (!key)
 				ASA_UNSUPPORTED("a subquery aggregated further must group by the sampling-entity key itself");
+			ctx.key_classes = list_make1(list_make1(key));
+			result.entities = 1;
+			result.key_attnos = asa_visible_keys(&ctx);
 			result.mask_attno = asa_expose_mask(query, asa_key_mask(&ctx, key));
 		}
 		return result;
@@ -1951,6 +2110,8 @@ asa_level(AsaStmt *st, Query *query, AsaKind kind, bool consumed, bool consumer_
 	{
 		if (query->distinctClause)
 			ASA_UNSUPPORTED("DISTINCT over entity-dependent rows below an aggregate is not supported");
+		result.entities = ctx.entities;
+		result.key_attnos = asa_visible_keys(&ctx);
 		result.mask_attno = asa_expose_mask(query, mask);
 		result.categorical = ctx.categorical;
 		return result;
@@ -2041,7 +2202,7 @@ asa_rewrite_query(ParseState *pstate, Query *query)
 	asa_reject_udfs_walker((Node *) query, &extension);
 	if (asa_uses_extension_walker((Node *) query, &extension))
 		return;
-	st.query_hash = asa_statement_query_hash(asa_noise_active() && !st.counters);
+	st.query_hash = asa_seed_query_hash();
 	asa_level(&st, query, ASA_TOP, false, false);
 }
 
@@ -2112,13 +2273,3 @@ asa_rewrite_init(void)
 	prev_post_parse_analyze_hook = post_parse_analyze_hook;
 	post_parse_analyze_hook = asa_post_parse_analyze;
 }
-
-#else							/* PG_VERSION_NUM < 160000 */
-
-void
-asa_rewrite_init(void)
-{
-	/* the rewrite relies on the PostgreSQL 16 range-table permission model */
-}
-
-#endif

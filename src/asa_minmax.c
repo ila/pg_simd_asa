@@ -33,7 +33,7 @@
 	{ \
 		uint64		update_count; \
 		uint64		key_hash;	/* OR of all masks seen */ \
-		uint64		query_hash; /* asa_* forms: the statement's query hash */ \
+		AsaReleaseParams rel;	/* asa_* forms */ \
 		T			global_bound;	/* worst of the 64 extremes (refreshed periodically) */ \
 		T			extremes[ASA_LANES]; \
 	} NAME##_state; \
@@ -165,10 +165,11 @@
 	{ \
 		NAME##_state *s = PG_ARGISNULL(0) ? NULL : (NAME##_state *) PG_GETARG_POINTER(0); \
 		asa_float	out[ASA_LANES]; \
+		AsaReleaseParams rel = asa_agg_release_params(from_arg, s ? &s->rel : NULL); \
 		double		value; \
 		NAME##_counters(s, out); \
-		if (!asa_release(fcinfo, 0, out, s ? s->key_hash : 0, s ? s->update_count : 0, \
-						 asa_agg_query_hash(from_arg, s ? s->query_hash : 0), \
+		/* the correction makes NULL less likely, but does not scale extremes */ \
+		if (!asa_release(fcinfo, 0, out, s ? s->key_hash : 0, s ? s->update_count : 0, &rel, false, \
 						 IS_MAX ? "as_noised_max" : "as_noised_min", &value)) \
 			PG_RETURN_NULL(); \
 		PG_RETURN_DATUM(asa_release_datum(fcinfo, value)); \
@@ -205,15 +206,14 @@
 			dst = NAME##_create(aggctx); \
 		dst->key_hash |= src->key_hash; \
 		dst->update_count += src->update_count; \
-		if (!dst->query_hash) \
-			dst->query_hash = src->query_hash; \
+		asa_release_params_merge(&dst->rel, &src->rel); \
 		for (int i = 0; i < ASA_LANES; i++) /* same type => same interleaving */ \
 			dst->extremes[i] = NAME##_better(dst->extremes[i], src->extremes[i]); \
 		NAME##_recompute_bound(dst); \
 		PG_RETURN_POINTER(dst); \
 	} \
 	\
-	ASA_DEFINE_QTRANS(NAME##_qtrans, NAME##_trans, NAME##_state, query_hash, 3) \
+	ASA_DEFINE_QTRANS(NAME##_qtrans, NAME##_trans, NAME##_state, rel, 3) \
 	\
 	PG_FUNCTION_INFO_V1(NAME##_serial); \
 	Datum \

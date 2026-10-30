@@ -155,13 +155,18 @@ asa_effective_mi(void)
 	return asa_noise_active() ? asa_mi : 0.0;
 }
 
-/* PacNoiseInNull with correction 1. */
+/*
+ * PacNoiseInNull: NULL with probability popcount(~key_hash) / (64 * correction), or
+ * without noise when no world received a row.
+ */
 static bool
-asa_noise_in_null(uint64 key_hash, double mi, AsaQueryState *qs)
+asa_noise_in_null(uint64 key_hash, double mi, double correction, AsaQueryState *qs)
 {
+	uint64		range = (uint64) (ASA_LANES * correction);
+
 	if (mi <= 0)
-		return asa_popcount64(key_hash) < 1;
-	return asa_popcount64(~key_hash) > (int) (pg_prng_uint64(&qs->rng) % ASA_LANES);
+		return asa_popcount64(key_hash) * correction < 1.0;
+	return asa_popcount64(~key_hash) > (int) (pg_prng_uint64(&qs->rng) % Max(range, 1));
 }
 
 /* PacNoisySampleFrom64Counters: vals already hold 0 for worlds outside key_hash. */
@@ -280,26 +285,34 @@ asa_check_diversity(FunctionCallInfo fcinfo, int slot, uint64 key_hash, const as
 
 bool
 asa_release(FunctionCallInfo fcinfo, int slot, const asa_float *counters, uint64 key_hash, uint64 update_count,
-			uint64 query_hash, const char *name, double *out)
+			const AsaReleaseParams *rel, bool scale, const char *name, double *out)
 {
 	double		mi = asa_effective_mi();
-	AsaQueryState *qs = asa_query_state(query_hash);
+	double		correction = asa_correction(rel);
+	AsaQueryState *qs = asa_query_state(rel->query_hash);
 	double		vals[ASA_LANES];
 
-	if (asa_noise_in_null(key_hash, mi, qs))
+	if (asa_noise_in_null(key_hash, mi, correction, qs))
 		return false;
 	if (asa_diversity_check && fcinfo)
 		asa_check_diversity(fcinfo, slot, key_hash, counters, update_count, name);
 	for (int j = 0; j < ASA_LANES; j++)
-		vals[j] = ((key_hash >> j) & 1) ? counters[j] : 0;
-	*out = (asa_float) asa_noisy_sample(vals, mi, query_hash, qs);	/* released as FLOAT, as in DuckDB */
+		vals[j] = ((key_hash >> j) & 1) ? (asa_float) (counters[j] * (scale ? correction : 1.0)) : 0;
+	*out = (asa_float) asa_noisy_sample(vals, mi, rel->query_hash, qs);	/* released as FLOAT, as in DuckDB */
 	return true;
 }
 
-uint64
-asa_agg_query_hash(bool from_arg, uint64 state_query_hash)
+AsaReleaseParams
+asa_agg_release_params(bool from_arg, const AsaReleaseParams *state)
 {
-	return from_arg ? state_query_hash : asa_seed_query_hash();
+	AsaReleaseParams rel = {asa_seed_query_hash(), 1.0};
+
+	if (from_arg)
+	{
+		rel.query_hash = state ? state->query_hash : 0;
+		rel.correction = asa_correction(state);
+	}
+	return rel;
 }
 
 /* Truncates towards zero (DuckDB's static_cast), clamped to [lo, hi]. */
@@ -351,11 +364,12 @@ asa_noised_common(FunctionCallInfo fcinfo, uint64 query_hash)
 {
 	asa_float	counters[ASA_LANES] = {0};
 	bool		nulls[ASA_LANES];
+	AsaReleaseParams rel = {query_hash, 1.0};
 	double		out;
 
 	if (asa_read_array(PG_GETARG_ARRAYTYPE_P(0), counters, nulls) != ASA_LANES)
 		PG_RETURN_NULL();
-	if (!asa_release(NULL, 0, counters, ~UINT64CONST(0), 0, query_hash, "as_noised", &out))
+	if (!asa_release(NULL, 0, counters, ~UINT64CONST(0), 0, &rel, false, "as_noised", &out))
 		PG_RETURN_NULL();
 	PG_RETURN_FLOAT8(out);
 }
