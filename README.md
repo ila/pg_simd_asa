@@ -176,7 +176,8 @@ unchanged.
 
 The rewrite runs at parse analysis (`post_parse_analyze_hook`), so result types are consistent
 for prepared statements and the extended protocol. Shapes it does not implement are rejected
-with an error rather than answered with ordinary one-world results: `DISTINCT` aggregates,
+with an error rather than answered with ordinary one-world results: user-defined functions
+or aggregates in entity-dependent queries, `DISTINCT` aggregates,
 window functions and grouping sets over entity-dependent rows, set operations, views and
 non-aggregating CTEs over entity-dependent relations (use a subquery), entity-dependent
 relations on the nullable side of an outer join (outside a subquery grouped by the entity),

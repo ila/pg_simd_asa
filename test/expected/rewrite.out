@@ -503,6 +503,61 @@ CREATE VIEW r_orders_v AS SELECT * FROM r_orders;
 SELECT count(*) FROM r_orders_v;
 ERROR:  SIMD-ASA rewrite: views over entity-dependent relations are not supported; use a subquery or CTE
 HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+-- Public UDFs must not masquerade as extension functions and bypass sampling.
+CREATE FUNCTION public.r_identity(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+SELECT sum(public.r_identity(o_total)) FROM r_orders;
+ERROR:  SIMD-ASA rewrite: user-defined function or aggregate "r_identity" is not supported
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+-- The restriction applies only to queries over entity-dependent data.
+SELECT sum(public.r_identity(n_key)) AS independent_udf FROM r_nation;
+ independent_udf 
+-----------------
+              10
+(1 row)
+
+DROP FUNCTION public.r_identity(integer);
+-- Actual extension functions remain valid with automatic rewriting enabled.
+SELECT array_length(as_count(priv_hash(asa_hash(c_custkey))), 1) AS explicit_extension FROM r_customer;
+ explicit_extension 
+--------------------
+                 64
+(1 row)
+
+-- Nested names resolve by lexical declaration, not by the last CTE visited.
+WITH x AS (SELECT o_total FROM r_orders)
+SELECT sum(x.o_total) FROM (WITH x AS (SELECT 1 AS v) SELECT v FROM x) d CROSS JOIN x;
+ERROR:  SIMD-ASA rewrite: CTE "x" reads entity-dependent relations without aggregating them; write it as a subquery in FROM
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+WITH x AS (SELECT o_total FROM r_orders)
+SELECT sum(x.o_total) FROM (WITH y AS (SELECT 1 AS v) SELECT v FROM y) d CROSS JOIN x;
+ERROR:  SIMD-ASA rewrite: CTE "x" reads entity-dependent relations without aggregating them; write it as a subquery in FROM
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+-- An ancestor CTE referenced two levels down is still entity-dependent.
+WITH x AS (SELECT o_total FROM r_orders)
+SELECT (SELECT sum(o_total) FROM (SELECT o_total FROM x) t);
+ERROR:  SIMD-ASA rewrite: CTE "x" reads entity-dependent relations without aggregating them; write it as a subquery in FROM
+HINT:  Rewrite the query by hand with the as_* aggregates, or SET simd_asa.rewrite = off.
+-- Aggregated CTE releases remain supported even when a nested CTE shadows their name.
+SET simd_asa.counters = off;
+SET simd_asa.noise = off;
+WITH x AS (SELECT sum(o_total) AS s FROM r_orders)
+SELECT pg_typeof(x.s) AS released_cte
+FROM (WITH x AS (SELECT 1 AS v) SELECT v FROM x) d CROSS JOIN x;
+ released_cte 
+--------------
+ bigint
+(1 row)
+
+SET simd_asa.counters = on;
+RESET simd_asa.noise;
+-- A local CTE shadows an outer dependent CTE, so its result stays scalar.
+WITH x AS (SELECT o_total FROM r_orders)
+SELECT (WITH x AS (SELECT 7 AS v) SELECT sum(v) FROM x) AS independent_cte;
+ independent_cte 
+-----------------
+               7
+(1 row)
+
 -- ---------------------------------------------------------------------------
 -- Several candidate sampling entities: each query selects one
 -- ---------------------------------------------------------------------------
