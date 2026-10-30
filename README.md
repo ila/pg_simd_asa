@@ -117,6 +117,12 @@ same plan. A different plan can differ: cells draw in the order they are finaliz
 workers combine floating-point partial sums in the order they finish (use
 `max_parallel_workers_per_gather = 0` for repeatable runs).
 
+This makes runs reproducible, not private across statements: every statement with the same
+seed releases the same world with the same noise draws. Two queries that differ in one entity
+(say, one with `WHERE c_custkey <> 42`) therefore get the same noise, and their difference
+reveals that entity's contribution in the released world. Use the seed for experiments and
+tests; to release to an analyst, change `simd_asa.seed` between statements.
+
 ## Automatic rewrite
 
 Declare the candidate sampling entities and the ownership links once. PostgreSQL extensions
