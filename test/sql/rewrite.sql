@@ -219,6 +219,35 @@ SELECT c_nation, count(*) FROM r_customer GROUP BY ROLLUP (c_nation);
 CREATE VIEW r_orders_v AS SELECT * FROM r_orders;
 SELECT count(*) FROM r_orders_v;
 
+-- Public UDFs must not masquerade as extension functions and bypass sampling.
+CREATE FUNCTION public.r_identity(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+SELECT sum(public.r_identity(o_total)) FROM r_orders;
+-- The restriction applies only to queries over entity-dependent data.
+SELECT sum(public.r_identity(n_key)) AS independent_udf FROM r_nation;
+DROP FUNCTION public.r_identity(integer);
+-- Actual extension functions remain valid with automatic rewriting enabled.
+SELECT array_length(as_count(priv_hash(asa_hash(c_custkey))), 1) AS explicit_extension FROM r_customer;
+
+-- Nested names resolve by lexical declaration, not by the last CTE visited.
+WITH x AS (SELECT o_total FROM r_orders)
+SELECT sum(x.o_total) FROM (WITH x AS (SELECT 1 AS v) SELECT v FROM x) d CROSS JOIN x;
+WITH x AS (SELECT o_total FROM r_orders)
+SELECT sum(x.o_total) FROM (WITH y AS (SELECT 1 AS v) SELECT v FROM y) d CROSS JOIN x;
+-- An ancestor CTE referenced two levels down is still entity-dependent.
+WITH x AS (SELECT o_total FROM r_orders)
+SELECT (SELECT sum(o_total) FROM (SELECT o_total FROM x) t);
+-- Aggregated CTE releases remain supported even when a nested CTE shadows their name.
+SET simd_asa.counters = off;
+SET simd_asa.noise = off;
+WITH x AS (SELECT sum(o_total) AS s FROM r_orders)
+SELECT pg_typeof(x.s) AS released_cte
+FROM (WITH x AS (SELECT 1 AS v) SELECT v FROM x) d CROSS JOIN x;
+SET simd_asa.counters = on;
+RESET simd_asa.noise;
+-- A local CTE shadows an outer dependent CTE, so its result stays scalar.
+WITH x AS (SELECT o_total FROM r_orders)
+SELECT (WITH x AS (SELECT 7 AS v) SELECT sum(v) FROM x) AS independent_cte;
+
 -- ---------------------------------------------------------------------------
 -- Several candidate sampling entities: each query selects one
 -- ---------------------------------------------------------------------------

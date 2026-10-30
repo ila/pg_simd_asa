@@ -43,10 +43,12 @@
 #include <math.h>
 
 #include "access/table.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
@@ -248,6 +250,13 @@ typedef struct AsaCte
 	bool		dependent;		/* its rows depend on the entity (no mask is passed up) */
 } AsaCte;
 
+/* Bind a CTE reference to its lexical declaration before rewriting any levels. */
+typedef struct AsaCteRef
+{
+	RangeTblEntry *rte;
+	CommonTableExpr *cte;
+} AsaCteRef;
+
 /* One statement being rewritten. */
 typedef struct AsaStmt
 {
@@ -256,6 +265,8 @@ typedef struct AsaStmt
 	bool		counters;		/* simd_asa.counters: world counters instead of releases */
 	const char *sourcetext;
 	List	   *ctes;			/* AsaCte *: CTEs processed so far */
+	List	   *cte_refs;		/* AsaCteRef *: lexical bindings, not names */
+	List	   *query_stack;	/* Query *: current level first during binding */
 	List	   *done;			/* Query *: sub-selects already rewritten */
 } AsaStmt;
 
@@ -515,17 +526,75 @@ asa_entity_key(AsaCtx *ctx, int rtindex, int depth)
  * Which parts of a query read entity-dependent relations
  * ------------------------------------------------------------------------- */
 
-/* The CTE of that name processed last (the innermost one in scope). */
-static AsaCte *
-asa_find_cte(AsaStmt *st, const char *name)
+/* PostgreSQL's ctelevelsup counts query levels, including CTE query bodies. */
+static bool
+asa_bind_ctes_walker(Node *node, AsaStmt *st)
 {
-	AsaCte	   *found = NULL;
+	ListCell   *lc;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		st->query_stack = lcons(node, st->query_stack);
+		query_tree_walker((Query *) node, asa_bind_ctes_walker, st, QTW_EXAMINE_RTES_BEFORE);
+		st->query_stack = list_delete_first(st->query_stack);
+		return false;
+	}
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		if (rte->rtekind == RTE_CTE)
+		{
+			Query *owner = list_nth(st->query_stack, rte->ctelevelsup);
+
+			foreach(lc, owner->cteList)
+			{
+				CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+				if (strcmp(cte->ctename, rte->ctename) == 0)
+				{
+					AsaCteRef *ref = palloc(sizeof(AsaCteRef));
+
+					ref->rte = rte;
+					ref->cte = cte;
+					st->cte_refs = lappend(st->cte_refs, ref);
+					break;
+				}
+			}
+		}
+		return false;
+	}
+	return expression_tree_walker(node, asa_bind_ctes_walker, st);
+}
+
+static CommonTableExpr *
+asa_cte_declaration(AsaStmt *st, RangeTblEntry *rte)
+{
+	ListCell   *lc;
+
+	foreach(lc, st->cte_refs)
+	{
+		AsaCteRef *ref = lfirst(lc);
+
+		if (ref->rte == rte)
+			return ref->cte;
+	}
+	ASA_UNSUPPORTED("cannot resolve CTE \"%s\" in its lexical scope", rte->ctename);
+	return NULL;
+}
+
+static AsaCte *
+asa_find_cte(AsaStmt *st, RangeTblEntry *rte)
+{
+	CommonTableExpr *declaration = asa_cte_declaration(st, rte);
 	ListCell   *lc;
 
 	foreach(lc, st->ctes)
-		if (strcmp(((AsaCte *) lfirst(lc))->cte->ctename, name) == 0)
-			found = (AsaCte *) lfirst(lc);
-	return found;
+		if (((AsaCte *) lfirst(lc))->cte == declaration)
+			return lfirst(lc);
+	return NULL;
 }
 
 static Query *
@@ -577,9 +646,14 @@ asa_depends_walker(Node *node, AsaStmt *st)
 				asa_is_dependent(st->meta, rte->relid);
 		if (rte->rtekind == RTE_CTE)
 		{
-			AsaCte	   *cte = asa_find_cte(st, rte->ctename);
+			AsaCte	   *cte = asa_find_cte(st, rte);
+			CommonTableExpr *declaration;
 
-			return cte && cte->dependent;
+			if (cte)
+				return cte->dependent;
+			declaration = asa_cte_declaration(st, rte);
+			/* The CTE body is also visited directly; do not follow recursive edges. */
+			return !declaration->cterecursive && asa_depends_query((Query *) declaration->ctequery, st);
 		}
 		return false;			/* subquery RTEs are descended into by range_table_walker */
 	}
@@ -1765,7 +1839,7 @@ asa_level_children(AsaCtx *ctx, bool below, bool grouped)
 		}
 		else if (below && rte->rtekind == RTE_CTE)
 		{
-			AsaCte	   *cte = asa_find_cte(ctx->stmt, rte->ctename);
+			AsaCte	   *cte = asa_find_cte(ctx->stmt, rte);
 
 			if (cte && cte->dependent)
 				ASA_UNSUPPORTED("CTE \"%s\" reads entity-dependent relations without aggregating them; "
@@ -2069,17 +2143,37 @@ asa_level(AsaStmt *st, Query *query, AsaKind kind, bool consumed, bool consumer_
  * rewritten before (EXPLAIN analyzes its query, then ExplainQuery calls the hook again).
  */
 static bool
-asa_uses_extension_walker(Node *node, Oid *schema)
+asa_uses_extension_walker(Node *node, Oid *extension)
 {
 	if (node == NULL)
 		return false;
-	if (IsA(node, Aggref) && get_func_namespace(((Aggref *) node)->aggfnoid) == *schema)
+	if (IsA(node, Aggref) && getExtensionOfObject(ProcedureRelationId, ((Aggref *) node)->aggfnoid) == *extension)
 		return true;
-	if (IsA(node, FuncExpr) && get_func_namespace(((FuncExpr *) node)->funcid) == *schema)
+	if (IsA(node, FuncExpr) && getExtensionOfObject(ProcedureRelationId, ((FuncExpr *) node)->funcid) == *extension)
 		return true;
 	if (IsA(node, Query))
-		return query_tree_walker((Query *) node, asa_uses_extension_walker, schema, 0);
-	return expression_tree_walker(node, asa_uses_extension_walker, schema);
+		return query_tree_walker((Query *) node, asa_uses_extension_walker, extension, 0);
+	return expression_tree_walker(node, asa_uses_extension_walker, extension);
+}
+
+/* User-defined functions may hide reads or computation that is not world-aware. */
+static bool
+asa_reject_udfs_walker(Node *node, Oid *extension)
+{
+	Oid function = InvalidOid;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr))
+		function = ((FuncExpr *) node)->funcid;
+	else if (IsA(node, Aggref))
+		function = ((Aggref *) node)->aggfnoid;
+	if (OidIsValid(function) && get_func_namespace(function) != PG_CATALOG_NAMESPACE &&
+		getExtensionOfObject(ProcedureRelationId, function) != *extension)
+		ASA_UNSUPPORTED("user-defined function or aggregate \"%s\" is not supported", get_func_name(function));
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, asa_reject_udfs_walker, extension, 0);
+	return expression_tree_walker(node, asa_reject_udfs_walker, extension);
 }
 
 static void
@@ -2088,6 +2182,7 @@ asa_rewrite_query(ParseState *pstate, Query *query)
 	AsaStmt		st = {0};
 	ListCell   *lc;
 	bool		has_nested = false;
+	Oid			extension = get_extension_oid("simd_asa", true);
 
 	/* a query without aggregates matters only if a sub-query (or view) might aggregate */
 	foreach(lc, query->rtable)
@@ -2099,11 +2194,15 @@ asa_rewrite_query(ParseState *pstate, Query *query)
 	if (!query->hasAggs && !has_nested && !query->hasSubLinks && query->cteList == NIL)
 		return;
 	st.meta = asa_load_meta();
-	if (!st.meta || asa_uses_extension_walker((Node *) query, &st.meta->schema))
+	if (!st.meta)
 		return;
+	asa_bind_ctes_walker((Node *) query, &st);
 	st.counters = asa_counters_setting;
 	st.sourcetext = pstate->p_sourcetext;
 	if (!asa_depends_query(query, &st))
+		return;
+	asa_reject_udfs_walker((Node *) query, &extension);
+	if (asa_uses_extension_walker((Node *) query, &extension))
 		return;
 	st.query_hash = asa_statement_query_hash(asa_noise_active() && !st.counters);
 	asa_level(&st, query, ASA_TOP, false, false);
