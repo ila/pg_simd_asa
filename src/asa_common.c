@@ -41,11 +41,7 @@ _PG_init(void)
 							 &asa_hash_repair, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	asa_noise_init();			/* noise settings and executor hooks */
 	asa_rewrite_init();			/* defines simd_asa.rewrite / simd_asa.entity: before reserving */
-#if PG_VERSION_NUM >= 150000
 	MarkGUCPrefixReserved("simd_asa");
-#else
-	EmitWarningsOnPlaceholders("simd_asa");
-#endif
 }
 
 /* ---------------------------------------------------------------------------

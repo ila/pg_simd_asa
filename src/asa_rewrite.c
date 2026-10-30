@@ -73,8 +73,6 @@
 #include "asa_common.h"
 #include "asa_noise.h"
 
-#if PG_VERSION_NUM >= 160000
-
 #define ASA_MAX_LINK_DEPTH 32
 #define ASA_MAX_INJECTED_JOINS 64
 
@@ -2275,13 +2273,3 @@ asa_rewrite_init(void)
 	prev_post_parse_analyze_hook = post_parse_analyze_hook;
 	post_parse_analyze_hook = asa_post_parse_analyze;
 }
-
-#else							/* PG_VERSION_NUM < 160000 */
-
-void
-asa_rewrite_init(void)
-{
-	/* the rewrite relies on the PostgreSQL 16 range-table permission model */
-}
-
-#endif

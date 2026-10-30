@@ -18,6 +18,11 @@
 #include "fmgr.h"
 #include "utils/array.h"
 
+/* pg_prng_double_normal (noise) and the range-table permission model (rewrite) */
+#if PG_VERSION_NUM < 160000
+#error "simd_asa requires PostgreSQL 16 or later"
+#endif
+
 #define ASA_LANES 64
 
 /* Output element type: PostgreSQL real (float4), as LIST<FLOAT> in DuckDB. */

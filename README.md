@@ -202,12 +202,12 @@ Q10, Q18 and Q22 (customer columns outside aggregates) and, with `priv_check`, Q
 by a key); here they run as DuckDB's hand-written versions of them do.
 
 The hook must be loaded in the session (`LOAD 'simd_asa'`, or `session_preload_libraries` /
-`shared_preload_libraries`); the rewrite requires PostgreSQL ≥ 16.
+`shared_preload_libraries`).
 
 ## Build, install, test
 
-Requires PostgreSQL ≥ 14 development files (`pg_config`) — ≥ 16 for the automatic
-rewrite — a C compiler, and a little-endian CPU.
+Requires PostgreSQL ≥ 16 development files (`pg_config`; tested on 16.15), a C compiler, and
+a little-endian CPU.
 
 ```sh
 make && make install                 # PGXS; builds with -O3
