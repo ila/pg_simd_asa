@@ -16,8 +16,10 @@
  *
  * Output lane j is the extreme of world j (no scaling) and 0 for worlds no row was
  * assigned to, as in DuckDB. numeric inputs take the double precision path.
+ * as_noised_min / as_noised_max release one noised extreme from the same state.
  */
 #include "asa_common.h"
+#include "asa_noise.h"
 
 #include <float.h>
 #include <math.h>
@@ -31,6 +33,7 @@
 	{ \
 		uint64		update_count; \
 		uint64		key_hash;	/* OR of all masks seen */ \
+		uint64		query_hash; /* asa_* forms: the statement's query hash */ \
 		T			global_bound;	/* worst of the 64 extremes (refreshed periodically) */ \
 		T			extremes[ASA_LANES]; \
 	} NAME##_state; \
@@ -128,18 +131,61 @@
 		PG_RETURN_POINTER(s); \
 	} \
 	\
-	PG_FUNCTION_INFO_V1(NAME##_final); \
-	Datum \
-	NAME##_final(PG_FUNCTION_ARGS) \
+	static void \
+	NAME##_counters(const NAME##_state *s, asa_float *out) \
 	{ \
-		NAME##_state *s = PG_ARGISNULL(0) ? NULL : (NAME##_state *) PG_GETARG_POINTER(0); \
-		asa_float	out[ASA_LANES]; \
 		const int	elems = 8 / (int) sizeof(T); \
 		const int	shifts = ASA_LANES / elems; \
 		for (int j = 0; j < ASA_LANES; j++) \
 			out[j] = (s && ((s->key_hash >> j) & 1)) ? \
 				(asa_float) s->extremes[(j % shifts) * elems + j / shifts] : 0; \
+	} \
+	\
+	PG_FUNCTION_INFO_V1(NAME##_final); \
+	Datum \
+	NAME##_final(PG_FUNCTION_ARGS) \
+	{ \
+		asa_float	out[ASA_LANES]; \
+		NAME##_counters(PG_ARGISNULL(0) ? NULL : (NAME##_state *) PG_GETARG_POINTER(0), out); \
 		PG_RETURN_ARRAYTYPE_P(asa_make_array(out)); \
+	} \
+	\
+	/* asa_counters_min/max: NULL without input rows */ \
+	PG_FUNCTION_INFO_V1(NAME##_counters_final); \
+	Datum \
+	NAME##_counters_final(PG_FUNCTION_ARGS) \
+	{ \
+		if (PG_ARGISNULL(0)) \
+			PG_RETURN_NULL(); \
+		return NAME##_final(fcinfo); \
+	} \
+	\
+	static Datum \
+	NAME##_noised(FunctionCallInfo fcinfo, bool from_arg) \
+	{ \
+		NAME##_state *s = PG_ARGISNULL(0) ? NULL : (NAME##_state *) PG_GETARG_POINTER(0); \
+		asa_float	out[ASA_LANES]; \
+		double		value; \
+		NAME##_counters(s, out); \
+		if (!asa_release(fcinfo, 0, out, s ? s->key_hash : 0, s ? s->update_count : 0, \
+						 asa_agg_query_hash(from_arg, s ? s->query_hash : 0), \
+						 IS_MAX ? "as_noised_max" : "as_noised_min", &value)) \
+			PG_RETURN_NULL(); \
+		PG_RETURN_DATUM(asa_release_datum(fcinfo, value)); \
+	} \
+	\
+	PG_FUNCTION_INFO_V1(NAME##_noised_final); \
+	Datum \
+	NAME##_noised_final(PG_FUNCTION_ARGS) \
+	{ \
+		return NAME##_noised(fcinfo, false); \
+	} \
+	\
+	PG_FUNCTION_INFO_V1(NAME##_qnoised_final); \
+	Datum \
+	NAME##_qnoised_final(PG_FUNCTION_ARGS) \
+	{ \
+		return NAME##_noised(fcinfo, true); \
 	} \
 	\
 	PG_FUNCTION_INFO_V1(NAME##_combine); \
@@ -159,11 +205,15 @@
 			dst = NAME##_create(aggctx); \
 		dst->key_hash |= src->key_hash; \
 		dst->update_count += src->update_count; \
+		if (!dst->query_hash) \
+			dst->query_hash = src->query_hash; \
 		for (int i = 0; i < ASA_LANES; i++) /* same type => same interleaving */ \
 			dst->extremes[i] = NAME##_better(dst->extremes[i], src->extremes[i]); \
 		NAME##_recompute_bound(dst); \
 		PG_RETURN_POINTER(dst); \
 	} \
+	\
+	ASA_DEFINE_QTRANS(NAME##_qtrans, NAME##_trans, NAME##_state, query_hash, 3) \
 	\
 	PG_FUNCTION_INFO_V1(NAME##_serial); \
 	Datum \

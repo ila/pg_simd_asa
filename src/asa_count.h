@@ -12,6 +12,7 @@ typedef struct AsaCountState
 	uint16		swar_fill;		/* updates in total8 since the last flush (0-254) */
 	uint64		key_hash;		/* OR of all masks seen: worlds that received a row */
 	uint64		update_count;	/* exact rows flushed from total8 */
+	uint64		query_hash;		/* asa_* forms: the statement's query hash */
 	uint64	   *totals;			/* lazily allocated uint64[64] */
 } AsaCountState;
 

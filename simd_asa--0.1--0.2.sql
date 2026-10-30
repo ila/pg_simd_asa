@@ -103,3 +103,201 @@ END
 $$;
 CREATE FUNCTION @extschema@.asa_lane_neg(real[]) RETURNS real[]
 AS 'MODULE_PATHNAME', 'asa_lane_neg' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- ---------------------------------------------------------------------------
+-- PAC noise release (asa_noise.c)
+--
+-- as_noised_count/sum/avg/min/max(mask [, value]) release one noised value per group,
+-- of the type the corresponding PostgreSQL aggregate returns: the PAC noise of the DuckDB
+-- extension (simd_asa.noise, simd_asa.mi). They share the transition functions of the
+-- as_* aggregates. The rewrite uses the asa_noised_* / asa_counters_* forms, whose last
+-- argument is the statement's query hash: equal arguments let PostgreSQL share one
+-- transition state between a noised aggregate and its counters (HAVING, top-k).
+-- ---------------------------------------------------------------------------
+
+-- The query hash priv_hash(bigint) and the as_noised_* aggregates use: derived from
+-- simd_asa.seed (the rewrite mixes in a per-statement nonce when noise is on).
+CREATE FUNCTION @extschema@.asa_query_hash() RETURNS bigint
+AS 'MODULE_PATHNAME', 'asa_query_hash' LANGUAGE C STABLE PARALLEL SAFE;
+
+-- Mask under an explicit query hash.
+CREATE FUNCTION @extschema@.priv_hash(bigint, bigint) RETURNS bigint
+AS 'MODULE_PATHNAME', 'asa_priv_hash_q' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+
+-- Noised release of a counter array (e.g. an expression evaluated per world).
+CREATE FUNCTION @extschema@.as_noised(real[]) RETURNS double precision
+AS 'MODULE_PATHNAME', 'as_noised' LANGUAGE C VOLATILE STRICT PARALLEL RESTRICTED;
+CREATE FUNCTION @extschema@.asa_noised(real[], bigint) RETURNS double precision
+AS 'MODULE_PATHNAME', 'asa_noised' LANGUAGE C VOLATILE STRICT PARALLEL RESTRICTED;
+
+-- Whether a row passes a predicate that holds in the worlds of mask.
+CREATE FUNCTION @extschema@.priv_filter(bigint) RETURNS boolean
+AS 'MODULE_PATHNAME', 'as_priv_filter' LANGUAGE C VOLATILE STRICT PARALLEL SAFE;
+CREATE FUNCTION @extschema@.asa_filter(bigint, bigint) RETURNS boolean
+AS 'MODULE_PATHNAME', 'asa_filter' LANGUAGE C VOLATILE STRICT PARALLEL SAFE;
+
+-- Mean of the non-NULL worlds (ranking before noise).
+CREATE FUNCTION @extschema@.priv_mean(real[]) RETURNS double precision
+AS 'MODULE_PATHNAME', 'as_priv_mean' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- Transition functions with a trailing query-hash argument, which they store in the state
+-- for the noised final functions.
+CREATE FUNCTION @extschema@.as_count_qtrans(internal, bigint, bigint) RETURNS internal
+AS 'MODULE_PATHNAME' LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE;
+CREATE FUNCTION @extschema@.as_count_any_qtrans(internal, bigint, "any", bigint) RETURNS internal
+AS 'MODULE_PATHNAME' LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE;
+
+-- Noised numeric sums and averages are summed as DuckDB's fused as_noised_sum sums DECIMAL:
+-- integers times 10^scale on the integer kernel. Counter arrays of numeric keep the float
+-- path, as DuckDB's as_sum lists.
+CREATE FUNCTION @extschema@.as_sum_numeric_scaled_trans(internal, bigint, numeric) RETURNS internal
+AS 'MODULE_PATHNAME' LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE;
+CREATE FUNCTION @extschema@.as_avg_numeric_scaled_trans(internal, bigint, numeric) RETURNS internal
+AS 'MODULE_PATHNAME' LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE;
+
+DO $$
+DECLARE
+    form record;
+    t record;
+    op text;
+    kind text;
+BEGIN
+    -- noised final functions: as_* (seed's query hash) and asa_* (query hash argument)
+    FOR form IN SELECT * FROM (VALUES ('as', 'noised'), ('asa', 'qnoised')) AS v(prefix, sym) LOOP
+        EXECUTE format('CREATE FUNCTION @extschema@.%s_noised_count_final(internal) RETURNS bigint '
+                       'AS %L, %L LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE',
+                       form.prefix, 'MODULE_PATHNAME', 'as_count_' || form.sym || '_final');
+    END LOOP;
+
+    -- ckind / nkind: state kind of the counter / noised forms; ntrans: C transition of the noised form
+    FOR t IN SELECT * FROM (VALUES
+        ('smallint', 'int2', 'int', 'int', 'int2', 'bigint', 'numeric', 288, 288, 160),
+        ('integer', 'int4', 'int', 'int', 'int4', 'bigint', 'numeric', 288, 288, 288),
+        ('bigint', 'int8', 'int', 'int', 'int8', 'numeric', 'numeric', 288, 288, 544),
+        ('real', 'float4', 'float', 'float', 'float4', 'real', 'double precision', 272, 272, 288),
+        ('double precision', 'float8', 'float', 'float', 'float8', 'double precision', 'double precision', 272, 272, 544),
+        ('numeric', 'numeric', 'float', 'int', 'numeric_scaled', 'numeric', 'numeric', 272, 288, 544))
+        AS v(sqltype, tag, ckind, nkind, ntrans, sumtype, avgtype, cspace, nspace, mmspace)
+    LOOP
+        -- query-hash transitions: counters (as as_*) and noised
+        FOREACH op IN ARRAY ARRAY['sum', 'avg'] LOOP
+            EXECUTE format('CREATE FUNCTION @extschema@.as_%s_%s_qtrans(internal, bigint, %s, bigint) RETURNS internal '
+                           'AS %L, %L LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE',
+                           op, t.tag, t.sqltype, 'MODULE_PATHNAME', 'as_' || op || '_' || t.tag || '_qtrans');
+            IF t.ntrans <> t.tag THEN
+                EXECUTE format('CREATE FUNCTION @extschema@.as_%s_%s_qtrans(internal, bigint, %s, bigint) RETURNS internal '
+                               'AS %L, %L LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE',
+                               op, t.ntrans, t.sqltype, 'MODULE_PATHNAME', 'as_' || op || '_' || t.ntrans || '_qtrans');
+            END IF;
+        END LOOP;
+        FOREACH op IN ARRAY ARRAY['min', 'max'] LOOP
+            EXECUTE format('CREATE FUNCTION @extschema@.as_%s_%s_qtrans(internal, bigint, %s, bigint) RETURNS internal '
+                           'AS %L, %L LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE',
+                           op, t.tag, t.sqltype, 'MODULE_PATHNAME', 'as_' || op || '_' || t.tag || '_qtrans');
+        END LOOP;
+
+        FOR form IN SELECT * FROM (VALUES ('as', 'noised'), ('asa', 'qnoised')) AS v(prefix, sym) LOOP
+            EXECUTE format('CREATE FUNCTION @extschema@.%s_noised_sum_%s_final(internal) RETURNS %s '
+                           'AS %L, %L LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE',
+                           form.prefix, t.tag, t.sumtype, 'MODULE_PATHNAME', 'as_sum_' || t.nkind || '_' || form.sym || '_final');
+            EXECUTE format('CREATE FUNCTION @extschema@.%s_noised_avg_%s_final(internal) RETURNS %s '
+                           'AS %L, %L LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE',
+                           form.prefix, t.tag, t.avgtype, 'MODULE_PATHNAME', 'as_avg_' || t.nkind || '_' || form.sym || '_final');
+            FOREACH op IN ARRAY ARRAY['min', 'max'] LOOP
+                EXECUTE format('CREATE FUNCTION @extschema@.%s_noised_%s_%s_final(internal) RETURNS %s '
+                               'AS %L, %L LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE',
+                               form.prefix, op, t.tag, t.sqltype, 'MODULE_PATHNAME',
+                               'as_' || op || '_' || t.tag || '_' || form.sym || '_final');
+            END LOOP;
+        END LOOP;
+
+        EXECUTE format('CREATE FUNCTION @extschema@.asa_counters_sum_%s_final(internal) RETURNS real[] '
+                       'AS %L, %L LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE',
+                       t.tag, 'MODULE_PATHNAME', 'as_sum_' || t.ckind || '_counters_final');
+        FOREACH op IN ARRAY ARRAY['min', 'max'] LOOP
+            EXECUTE format('CREATE FUNCTION @extschema@.asa_counters_%s_%s_final(internal) RETURNS real[] '
+                           'AS %L, %L LANGUAGE C CALLED ON NULL INPUT PARALLEL SAFE',
+                           op, t.tag, 'MODULE_PATHNAME', 'as_' || op || '_' || t.tag || '_counters_final');
+        END LOOP;
+
+        FOREACH op IN ARRAY ARRAY['sum', 'avg'] LOOP
+            -- as_noised_sum/avg(mask, value)
+            EXECUTE format(
+                'CREATE AGGREGATE @extschema@.as_noised_%s(bigint, %s) (SFUNC = @extschema@.as_%s_%s_trans, '
+                'STYPE = internal, SSPACE = %s, FINALFUNC = @extschema@.as_noised_%s_%s_final, '
+                'COMBINEFUNC = @extschema@.as_%s_%s_combine, SERIALFUNC = @extschema@.as_%s_%s_serial, '
+                'DESERIALFUNC = @extschema@.as_%s_%s_deserial, PARALLEL = SAFE)',
+                op, t.sqltype, op, t.ntrans, t.nspace + CASE op WHEN 'avg' THEN 112 ELSE 0 END, op, t.tag,
+                op, t.nkind, op, t.nkind, op, t.nkind);
+            -- asa_noised_sum/avg(mask, value, query_hash)
+            EXECUTE format(
+                'CREATE AGGREGATE @extschema@.asa_noised_%s(bigint, %s, bigint) (SFUNC = @extschema@.as_%s_%s_qtrans, '
+                'STYPE = internal, SSPACE = %s, FINALFUNC = @extschema@.asa_noised_%s_%s_final, '
+                'COMBINEFUNC = @extschema@.as_%s_%s_combine, SERIALFUNC = @extschema@.as_%s_%s_serial, '
+                'DESERIALFUNC = @extschema@.as_%s_%s_deserial, PARALLEL = SAFE)',
+                op, t.sqltype, op, t.ntrans, t.nspace + CASE op WHEN 'avg' THEN 112 ELSE 0 END, op, t.tag,
+                op, t.nkind, op, t.nkind, op, t.nkind);
+            -- asa_counters_sum/avg(mask, value, query_hash): as as_sum/as_avg, NULL without rows
+            EXECUTE format(
+                'CREATE AGGREGATE @extschema@.asa_counters_%s(bigint, %s, bigint) (SFUNC = @extschema@.as_%s_%s_qtrans, '
+                'STYPE = internal, SSPACE = %s, FINALFUNC = @extschema@.%s, '
+                'COMBINEFUNC = @extschema@.as_%s_%s_combine, SERIALFUNC = @extschema@.as_%s_%s_serial, '
+                'DESERIALFUNC = @extschema@.as_%s_%s_deserial, PARALLEL = SAFE)',
+                op, t.sqltype, op, t.tag, t.cspace + CASE op WHEN 'avg' THEN 112 ELSE 0 END,
+                CASE op WHEN 'sum' THEN format('asa_counters_sum_%s_final', t.tag)
+                        ELSE format('as_avg_%s_final', t.ckind) END,
+                op, t.ckind, op, t.ckind, op, t.ckind);
+        END LOOP;
+
+        FOREACH op IN ARRAY ARRAY['min', 'max'] LOOP
+            EXECUTE format(
+                'CREATE AGGREGATE @extschema@.as_noised_%s(bigint, %s) (SFUNC = @extschema@.as_%s_%s_trans, STYPE = internal, '
+                'SSPACE = %s, FINALFUNC = @extschema@.as_noised_%s_%s_final, COMBINEFUNC = @extschema@.as_%s_%s_combine, '
+                'SERIALFUNC = @extschema@.as_%s_%s_serial, DESERIALFUNC = @extschema@.as_%s_%s_deserial, PARALLEL = SAFE)',
+                op, t.sqltype, op, t.tag, t.mmspace, op, t.tag, op, t.tag, op, t.tag, op, t.tag);
+            FOREACH kind IN ARRAY ARRAY['noised', 'counters'] LOOP
+                EXECUTE format(
+                    'CREATE AGGREGATE @extschema@.asa_%s_%s(bigint, %s, bigint) (SFUNC = @extschema@.as_%s_%s_qtrans, '
+                    'STYPE = internal, SSPACE = %s, FINALFUNC = @extschema@.%s, '
+                    'COMBINEFUNC = @extschema@.as_%s_%s_combine, SERIALFUNC = @extschema@.as_%s_%s_serial, '
+                    'DESERIALFUNC = @extschema@.as_%s_%s_deserial, PARALLEL = SAFE)',
+                    kind, op, t.sqltype, op, t.tag, t.mmspace,
+                    CASE kind WHEN 'noised' THEN format('asa_noised_%s_%s_final', op, t.tag)
+                              ELSE format('asa_counters_%s_%s_final', op, t.tag) END,
+                    op, t.tag, op, t.tag, op, t.tag);
+            END LOOP;
+        END LOOP;
+    END LOOP;
+END
+$$;
+
+CREATE AGGREGATE @extschema@.as_noised_count(bigint) (
+    SFUNC = @extschema@.as_count_trans, STYPE = internal, SSPACE = 112,
+    FINALFUNC = @extschema@.as_noised_count_final, COMBINEFUNC = @extschema@.as_count_combine,
+    SERIALFUNC = @extschema@.as_count_serial, DESERIALFUNC = @extschema@.as_count_deserial, PARALLEL = SAFE
+);
+CREATE AGGREGATE @extschema@.as_noised_count(bigint, "any") (
+    SFUNC = @extschema@.as_count_any_trans, STYPE = internal, SSPACE = 112,
+    FINALFUNC = @extschema@.as_noised_count_final, COMBINEFUNC = @extschema@.as_count_combine,
+    SERIALFUNC = @extschema@.as_count_serial, DESERIALFUNC = @extschema@.as_count_deserial, PARALLEL = SAFE
+);
+CREATE AGGREGATE @extschema@.asa_noised_count(bigint, bigint) (
+    SFUNC = @extschema@.as_count_qtrans, STYPE = internal, SSPACE = 112,
+    FINALFUNC = @extschema@.asa_noised_count_final, COMBINEFUNC = @extschema@.as_count_combine,
+    SERIALFUNC = @extschema@.as_count_serial, DESERIALFUNC = @extschema@.as_count_deserial, PARALLEL = SAFE
+);
+CREATE AGGREGATE @extschema@.asa_noised_count(bigint, "any", bigint) (
+    SFUNC = @extschema@.as_count_any_qtrans, STYPE = internal, SSPACE = 112,
+    FINALFUNC = @extschema@.asa_noised_count_final, COMBINEFUNC = @extschema@.as_count_combine,
+    SERIALFUNC = @extschema@.as_count_serial, DESERIALFUNC = @extschema@.as_count_deserial, PARALLEL = SAFE
+);
+CREATE AGGREGATE @extschema@.asa_counters_count(bigint, bigint) (
+    SFUNC = @extschema@.as_count_qtrans, STYPE = internal, SSPACE = 112,
+    FINALFUNC = @extschema@.as_count_final, COMBINEFUNC = @extschema@.as_count_combine,
+    SERIALFUNC = @extschema@.as_count_serial, DESERIALFUNC = @extschema@.as_count_deserial, PARALLEL = SAFE
+);
+CREATE AGGREGATE @extschema@.asa_counters_count(bigint, "any", bigint) (
+    SFUNC = @extschema@.as_count_any_qtrans, STYPE = internal, SSPACE = 112,
+    FINALFUNC = @extschema@.as_count_final, COMBINEFUNC = @extschema@.as_count_combine,
+    SERIALFUNC = @extschema@.as_count_serial, DESERIALFUNC = @extschema@.as_count_deserial, PARALLEL = SAFE
+);

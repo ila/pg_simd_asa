@@ -11,10 +11,11 @@
  *
  * Output lane j is 2 * count_j (the 2x compensates the 50% inclusion probability of
  * a uniform 64-bit mask) and 0 for worlds no row was assigned to — identical to
- * as_count in DuckDB.
+ * as_count in DuckDB. as_noised_count releases one noised count from the same state.
  */
 #include "asa_common.h"
 #include "asa_count.h"
+#include "asa_noise.h"
 
 /* Selects the lowest bit of each byte. */
 #define ASA_COUNT_MASK UINT64CONST(0x0101010101010101)
@@ -90,6 +91,8 @@ asa_count_combine(AsaCountState *dst, const AsaCountState *src, MemoryContext ct
 	asa_count_get_totals(src, totals);
 	dst->key_hash |= src->key_hash;
 	dst->update_count += src->update_count + src->swar_fill;
+	if (!dst->query_hash)
+		dst->query_hash = src->query_hash;
 }
 
 /* Lane j: 2 * count_j for worlds that received a row, 0 otherwise. */
@@ -104,8 +107,8 @@ asa_count_finalize(const AsaCountState *s, asa_float *out)
 		out[j] = (s && ((s->key_hash >> j) & 1)) ? (asa_float) ((double) totals[j] * 2.0) : 0;
 }
 
-/* Serialized form: key_hash, update_count, 64 exact totals (SWAR bytes folded in). */
-#define ASA_COUNT_SERIAL_SIZE ((2 + ASA_LANES) * sizeof(uint64))
+/* Serialized form: key_hash, update_count, query_hash, 64 exact totals (SWAR bytes folded in). */
+#define ASA_COUNT_SERIAL_SIZE ((3 + ASA_LANES) * sizeof(uint64))
 
 void
 asa_count_write(AsaWriter *w, const AsaCountState *s)
@@ -116,6 +119,7 @@ asa_count_write(AsaWriter *w, const AsaCountState *s)
 	asa_count_get_totals(s, totals);
 	asa_write(w, &s->key_hash, sizeof(uint64));
 	asa_write(w, &update_count, sizeof(uint64));
+	asa_write(w, &s->query_hash, sizeof(uint64));
 	asa_write(w, totals, sizeof(totals));
 }
 
@@ -133,6 +137,7 @@ asa_count_read(AsaReader *r)
 	s->totals = (uint64 *) palloc(ASA_LANES * sizeof(uint64));
 	asa_read(r, &s->key_hash, sizeof(uint64));
 	asa_read(r, &s->update_count, sizeof(uint64));
+	asa_read(r, &s->query_hash, sizeof(uint64));
 	asa_read(r, s->totals, ASA_LANES * sizeof(uint64));
 	return s;
 }
@@ -175,6 +180,9 @@ as_count_any_trans(PG_FUNCTION_ARGS)
 	return asa_count_trans_common(fcinfo, PG_ARGISNULL(1) || PG_ARGISNULL(2));
 }
 
+ASA_DEFINE_QTRANS(as_count_qtrans, as_count_trans, AsaCountState, query_hash, 2)
+ASA_DEFINE_QTRANS(as_count_any_qtrans, as_count_any_trans, AsaCountState, query_hash, 3)
+
 PG_FUNCTION_INFO_V1(as_count_final);
 Datum
 as_count_final(PG_FUNCTION_ARGS)
@@ -183,6 +191,38 @@ as_count_final(PG_FUNCTION_ARGS)
 
 	asa_count_finalize(PG_ARGISNULL(0) ? NULL : (AsaCountState *) PG_GETARG_POINTER(0), out);
 	PG_RETURN_ARRAYTYPE_P(asa_make_array(out));
+}
+
+/*
+ * as_noised_count: PAC release of the counts (as_count.cpp PacCountFinalize). The query
+ * hash is the last argument for the rewrite's asa_noised_count, else the seed's.
+ */
+static Datum
+asa_count_noised_final(FunctionCallInfo fcinfo, bool from_arg)
+{
+	AsaCountState *s = PG_ARGISNULL(0) ? NULL : (AsaCountState *) PG_GETARG_POINTER(0);
+	asa_float	out[ASA_LANES];
+	double		value;
+
+	asa_count_finalize(s, out);
+	if (!asa_release(fcinfo, 0, out, s ? s->key_hash : 0, s ? s->update_count + s->swar_fill : 0,
+					 asa_agg_query_hash(from_arg, s ? s->query_hash : 0), "as_noised_count", &value))
+		PG_RETURN_NULL();
+	PG_RETURN_DATUM(asa_release_datum(fcinfo, value));
+}
+
+PG_FUNCTION_INFO_V1(as_count_noised_final);
+Datum
+as_count_noised_final(PG_FUNCTION_ARGS)
+{
+	return asa_count_noised_final(fcinfo, false);
+}
+
+PG_FUNCTION_INFO_V1(as_count_qnoised_final);
+Datum
+as_count_qnoised_final(PG_FUNCTION_ARGS)
+{
+	return asa_count_noised_final(fcinfo, true);
 }
 
 PG_FUNCTION_INFO_V1(as_count_combine);

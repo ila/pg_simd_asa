@@ -1,9 +1,10 @@
 /*
  * asa_common.h — shared definitions for the SIMD-ASA PostgreSQL extension.
  *
- * Port of the mode-agnostic aggregate engine of the DuckDB `privacy` extension
- * (src/include/aggregates/as_aggregate.hpp). Only the stochastic-aggregation
- * layer is ported: no noise, no privacy mechanism, no query rewriter.
+ * Port of the aggregate engine of the DuckDB `privacy` extension
+ * (src/include/aggregates/as_aggregate.hpp): the stochastic aggregates, the PAC noise
+ * release (asa_noise.c) and the query rewrite (asa_rewrite.c). The DP mechanisms are
+ * not ported.
  *
  * A 64-bit membership mask (PostgreSQL bigint, interpreted as uint64) selects
  * which of the 64 worlds a tuple belongs to: bit j set => the tuple contributes
@@ -66,6 +67,17 @@ asa_agg_context(FunctionCallInfo fcinfo, const char *fname)
 
 /* Defines the rewrite settings and installs the parse-analysis hook (asa_rewrite.c). */
 extern void asa_rewrite_init(void);
+
+/* Defines the noise settings and installs the executor hooks (asa_noise.c). */
+extern void asa_noise_init(void);
+
+/*
+ * Query hashes (asa_common.c). A query hash is XOR-ed into every membership mask
+ * (priv_hash) and selects the released world and the noise of a statement.
+ */
+extern uint64 asa_query_hash_from_seed(uint64 seed);
+extern uint64 asa_seed_query_hash(void);
+extern uint64 asa_statement_query_hash(bool noise);
 
 /* Builds a 64-element real[] without NULLs. */
 extern ArrayType *asa_make_array(const asa_float *vals);
