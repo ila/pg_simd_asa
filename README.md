@@ -57,6 +57,12 @@ noised value per group ([Release](#release)); the 64 answers themselves are avai
 
 ## Quick start
 
+Say we want to know how much the quantities, discounts and line counts per return flag in
+TPC-H depend on which customers are in the data: how different would they be on another random
+half of the customers? Directly, that means drawing 64 random halves of `customer`, keeping
+each half's `orders` and `lineitem` rows, and running the query 64 times. With `simd_asa` we
+declare the customer as the sampling entity once and run the query as usual:
+
 ```sql
 CREATE EXTENSION simd_asa;
 
