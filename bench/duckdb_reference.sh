@@ -1,6 +1,6 @@
 #!/bin/sh
 # Writes the DuckDB references of bench/tpch_crosscheck.py: the 22 TPC-H queries through the
-# DuckDB privacy extension (https://github.com/cwida/privacy) without noise.
+# DuckDB privacy extension without noise.
 #
 # usage: bench/duckdb_reference.sh <duckdb binary with the privacy extension> <TPC-H database> \
 #                                  <privacy repository> <output directory>
