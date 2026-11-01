@@ -162,8 +162,9 @@ The overhead comes mostly from the joins that find each row's entity where the q
 (Q1, Q6, Q14, Q15 and Q20 read `lineitem` without `orders`), not from the 64-world aggregates;
 aggregation-heavy Q1 is the exception. Q2, Q11 and Q16 read no entity-dependent table and are
 not rewritten, so their ratios show the run-to-run variance of the disk-bound setup (Q9's runs
-alone range from 447 s to 545 s). Q17 is faster only because PostgreSQL picks a better plan for
-the rewritten query. Measured with `bench/tpch_timing.py "psql -d tpch30" 2 4`
+alone range from 447 s to 545 s). Q17's 0.05 is a planner effect, not a speedup: PostgreSQL
+runs the ordinary query as a serial full scan of `lineitem` (234 s); with the `l_partkey` index
+plan it takes 22 s. Measured with `bench/tpch_timing.py "psql -d tpch30" 2 4`
 (`PGOPTIONS="-c work_mem=256MB"`), with noise off (`simd_asa.noise = off`); the noise is added
 once per output cell, after aggregation.
 
