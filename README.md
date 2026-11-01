@@ -3,8 +3,7 @@
 `simd_asa` evaluates an aggregate query over 64 sampled versions of a database in a single
 execution, instead of running it once per sample. It is a PostgreSQL port of SIMD-ASA from the
 DuckDB `privacy` extension: the 64-world aggregates, a rewrite that applies them to ordinary
-SQL, and that extension's noised release of the 64 answers. On all 22 TPC-H queries it returns
-what the DuckDB extension returns.
+SQL, and that extension's noised release of the 64 answers.
 
 ## The problem: sampled execution is slow
 
