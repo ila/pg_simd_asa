@@ -1,6 +1,6 @@
--- Automatic rewrite with PAC releases (the default): noised aggregates, FROM-clause
+-- Automatic rewrite with AS releases (the default): noised aggregates, FROM-clause
 -- subqueries, CTEs, HAVING, predicates over worlds, top-k. Without noise every release is
--- deterministic (world 0 of the counters, as DuckDB with pac_mi = 0), so each rewritten
+-- deterministic (world 0 of the counters, as DuckDB with noise off), so each rewritten
 -- query is checked against the hand-written query it should become.
 LOAD 'simd_asa';
 SET extra_float_digits = 0;

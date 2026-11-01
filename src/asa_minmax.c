@@ -1,7 +1,7 @@
 /*
  * asa_minmax.c — as_min(mask, value) / as_max(mask, value) -> real[64]
  *
- * Port of PacMinMaxState (DuckDB: src/include/aggregates/as_min_max.hpp).
+ * Port of the min/max state of DuckDB's as_min/as_max (src/include/aggregates/as_min_max.hpp).
  *
  * The state keeps T extremes[64]. An update is branch-free: the membership bits are
  * extracted SWAR-style into a T-wide 0/1 per world, turned into an all-ones/all-zeros

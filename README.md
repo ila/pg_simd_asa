@@ -131,49 +131,42 @@ TPC-H SF30 (44 GB) on a MacBook Pro (Apple M1, 16 GB), PostgreSQL 16.15, 4 paral
 `work_mem = 256MB`, JIT off; median of 2 runs after a warm-up, in ms. The database does not fit
 in memory, so the runs read from disk.
 
-**Evaluating 64 worlds makes TPC-H at most 2.1× slower than the ordinary single-world query
-(Q1); all other queries are within 1.5×, most within 5%.**
+**Evaluating 64 worlds makes TPC-H at most 2.2× slower than the ordinary single-world query
+(Q1); all other queries are within 1.5×.**
 
 | Query | ordinary | 64 worlds | 64 worlds / ordinary |
 |---|---:|---:|---:|
-| Q1 | 63992 | 136868 | 2.14 |
-| Q2 | 9044 | 8905 | 0.98 |
-| Q3 | 51515 | 50467 | 0.98 |
-| Q4 | 33309 | 33806 | 1.01 |
-| Q5 | 51916 | 50628 | 0.98 |
-| Q6 | 36262 | 52088 | 1.44 |
-| Q7 | 51622 | 50819 | 0.98 |
-| Q8 | 54354 | 54185 | 1.00 |
-| Q9 | 679419 | 647517 | 0.95 |
-| Q10 | 50228 | 50277 | 1.00 |
-| Q11 | 12451 | 12654 | 1.02 |
-| Q12 | 50871 | 53573 | 1.05 |
-| Q13 | 35460 | 42782 | 1.21 |
-| Q14 | 38041 | 50930 | 1.34 |
-| Q15 | 37393 | 55217 | 1.48 |
-| Q16 | 10642 | 10514 | 0.99 |
-| Q17 | 308806 | 11145 | 0.04 |
-| Q18 | 269826 | 268325 | 0.99 |
-| Q19 | 9532 | 9058 | 0.95 |
-| Q20 | 190121 | 243652 | 1.28 |
-| Q21 | 48849 | 49044 | 1.00 |
-| Q22 | 14862 | 16982 | 1.14 |
+| Q1 | 58689 | 130769 | 2.23 |
+| Q2 | 11149 | 8612 | 0.77 |
+| Q3 | 61770 | 52903 | 0.86 |
+| Q4 | 36940 | 37587 | 1.02 |
+| Q5 | 55417 | 59942 | 1.08 |
+| Q6 | 38745 | 54579 | 1.41 |
+| Q7 | 60070 | 60499 | 1.01 |
+| Q8 | 64077 | 55470 | 0.87 |
+| Q9 | 531423 | 490601 | 0.92 |
+| Q10 | 53819 | 50909 | 0.95 |
+| Q11 | 12302 | 12025 | 0.98 |
+| Q12 | 53794 | 54705 | 1.02 |
+| Q13 | 35687 | 37611 | 1.05 |
+| Q14 | 45888 | 56047 | 1.22 |
+| Q15 | 39555 | 56356 | 1.42 |
+| Q16 | 11139 | 10913 | 0.98 |
+| Q17 | 234388 | 11046 | 0.05 |
+| Q18 | 290547 | 296334 | 1.02 |
+| Q19 | 9209 | 9084 | 0.99 |
+| Q20 | 166532 | 218401 | 1.31 |
+| Q21 | 47772 | 52597 | 1.10 |
+| Q22 | 15094 | 13694 | 0.91 |
 
-The overhead comes mostly from the joins that find each row's entity where the
-query has none (Q1, Q6, Q14, Q15 and Q20 read `lineitem` without `orders`), not from the
-64-world aggregates; aggregation-heavy Q1 is the exception. Q2, Q11 and Q16 read no
-entity-dependent table and are not rewritten. Q17 is faster only because PostgreSQL picks a
-better plan for the rewritten query. Measured with `bench/tpch_timing.py "psql -d tpch30" 2 4`
-(`PGOPTIONS="-c work_mem=256MB"`), with the default release.
-
-Against writing the 64 worlds out in SQL (`bench/tpch_q1.py`: Q1 with 512 `FILTER` aggregates,
-one per world and aggregate), SF1, median of 3 runs:
-
-| Q1 variant | Worlds | Serial | 4 workers |
-|---|---:|---:|---:|
-| ordinary | 1 | 3.58 s | 0.92 s |
-| `as_*` aggregates | 64 | 6.08 s | 1.52 s |
-| conditional SQL | 64 | 131.5 s | 32.4 s |
+The overhead comes mostly from the joins that find each row's entity where the query has none
+(Q1, Q6, Q14, Q15 and Q20 read `lineitem` without `orders`), not from the 64-world aggregates;
+aggregation-heavy Q1 is the exception. Q2, Q11 and Q16 read no entity-dependent table and are
+not rewritten, so their ratios show the run-to-run variance of the disk-bound setup (Q9's runs
+alone range from 447 s to 545 s). Q17 is faster only because PostgreSQL picks a better plan for
+the rewritten query. Measured with `bench/tpch_timing.py "psql -d tpch30" 2 4`
+(`PGOPTIONS="-c work_mem=256MB"`), with noise off (`simd_asa.noise = off`); the noise is added
+once per output cell, after aggregation.
 
 ## Release
 
@@ -262,8 +255,7 @@ make installcheck    # against a running server (PGHOST/PGPORT/PGUSER)
 ```
 
 The tests check every world of every aggregate against 64 `FILTER (WHERE bit j)` aggregates,
-and every rewritten query against its hand-written version. `bench/tpch_crosscheck.py` checks
-that all 22 TPC-H queries return what the DuckDB extension returns.
+and every rewritten query against its hand-written version.
 
 ## License
 

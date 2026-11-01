@@ -3,9 +3,8 @@
  *
  * Membership hashing ports priv_hash() from the DuckDB extension
  * (src/aggregates/as_aggregate.cpp): priv_hash(asa_hash(k)) here returns the same
- * mask as priv_hash(hash(k)) in DuckDB with privacy_seed = simd_asa.seed,
- * pac_hash_repair = simd_asa.hash_repair and pac_mi = 0 (deterministic seed), for
- * BIGINT/INTEGER keys.
+ * mask as priv_hash(hash(k)) in DuckDB with the same seed, hash repair and noise off
+ * (deterministic seed), for BIGINT/INTEGER keys.
  */
 #include "asa_common.h"
 
@@ -23,7 +22,7 @@ PG_MODULE_MAGIC;
 #define ASA_HASH_PRIME UINT64CONST(0xB2833106536E95DF)
 
 static int	asa_seed = 42;
-static bool asa_hash_repair = false;	/* DuckDB's pac_hash_repair also defaults to false */
+static bool asa_hash_repair = false;	/* DuckDB's hash repair also defaults to off */
 
 void		_PG_init(void);
 
@@ -157,7 +156,7 @@ asa_murmur64(uint64 x)
 	return x;
 }
 
-/* Repairs a 64-bit hash to exactly 32 set bits (PacRepairHash32 in DuckDB). */
+/* Repairs a 64-bit hash to exactly 32 set bits (as in DuckDB). */
 static uint64
 asa_repair_hash32(uint64 num)
 {

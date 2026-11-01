@@ -1,7 +1,7 @@
 /*
  * asa_sum.c — as_sum(mask, value) and as_avg(mask, value) -> real[64]
  *
- * Port of PacSumIntState / PacSumDoubleState (DuckDB: src/include/aggregates/as_sum.hpp,
+ * Port of the integer and floating-point sum states of DuckDB's as_sum (src/include/aggregates/as_sum.hpp,
  * src/aggregates/as_sum.cpp), default (approximate, double-sided) configuration.
  *
  * Integers (smallint, integer, bigint): instead of 64 conditional 64-bit additions,
@@ -56,7 +56,7 @@
 
 static const double asa_pow10[ASA_NUMERIC_MAX_SCALE + 1] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9};
 
-/* Unsigned approximate integer sum state (PacSumIntState<false>). */
+/* Unsigned approximate integer sum state. */
 typedef struct AsaSumIntState
 {
 	uint64		key_hash;		/* OR of all masks seen */

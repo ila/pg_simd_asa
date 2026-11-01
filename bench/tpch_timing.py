@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Times the 22 TPC-H queries: ordinary SQL vs the automatic SIMD-ASA rewrite.
+"""Times the 22 TPC-H queries: the ordinary query vs the rewrite over 64 worlds (noise off).
 
-Configurations: "plain" (simd_asa.rewrite = off: the one-world query), "noised" (the rewrite
-with PAC noise, the default) and "deterministic" (simd_asa.noise = off). Each query runs once
-to warm up, then RUNS times per configuration in one session; the median of psql's \\timing
-is reported in ms. Q2, Q11 and Q16 read no entity-dependent relation and are not rewritten.
+Each query runs once to warm up, then RUNS times per configuration in one session; the median
+of psql's \\timing is reported in ms.
 
 usage: bench/tpch_timing.py "<psql command>" [runs] [workers]
 """
@@ -19,9 +17,8 @@ RUNS = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 WORKERS = int(sys.argv[3]) if len(sys.argv) > 3 else 4
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIGS = {
-    "plain": "SET simd_asa.rewrite = off;",
-    "noised": "SET simd_asa.rewrite = on;",
-    "deterministic": "SET simd_asa.rewrite = on;\nSET simd_asa.noise = off;",
+    "ordinary": "SET simd_asa.rewrite = off;",
+    "64 worlds": "SET simd_asa.rewrite = on; SET simd_asa.noise = off;",
 }
 
 
@@ -35,11 +32,11 @@ def time_query(query, settings):
     return statistics.median(times)
 
 
-print(f"| Query | {' | '.join(CONFIGS)} | noised / plain |")
-print("|---|" + "---:|" * (len(CONFIGS) + 1))
+print("| Query | ordinary | 64 worlds | 64 worlds / ordinary |")
+print("|---|---:|---:|---:|")
 for n in range(1, 23):
     with open(os.path.join(HERE, "tpch_queries", f"q{n:02d}.sql")) as f:
         query = f.read().strip()
     t = {name: time_query(query, settings) for name, settings in CONFIGS.items()}
-    print(f"| Q{n} | " + " | ".join(f"{t[c]:.1f}" for c in CONFIGS) + f" | {t['noised'] / t['plain']:.2f} |",
+    print(f"| Q{n} | {t['ordinary']:.0f} | {t['64 worlds']:.0f} | {t['64 worlds'] / t['ordinary']:.2f} |",
           flush=True)

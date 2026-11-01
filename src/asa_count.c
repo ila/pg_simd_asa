@@ -1,7 +1,7 @@
 /*
  * asa_count.c — as_count(mask [, value]) -> real[64]
  *
- * Port of PacCountState (DuckDB: src/include/aggregates/as_count.hpp).
+ * Port of the count state of DuckDB's as_count (src/include/aggregates/as_count.hpp).
  *
  * World j counts the rows whose mask has bit j set. SWAR (SIMD Within A Register):
  * eight uint64 words each hold eight packed uint8 counters, so a single update is
@@ -195,7 +195,7 @@ as_count_final(PG_FUNCTION_ARGS)
 }
 
 /*
- * as_noised_count: PAC release of the counts (as_count.cpp PacCountFinalize). The query
+ * as_noised_count: AS release of the counts (as_count.cpp). The query
  * hash is the last argument for the rewrite's asa_noised_count, else the seed's.
  */
 static Datum

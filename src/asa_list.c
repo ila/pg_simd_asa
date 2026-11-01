@@ -1,8 +1,8 @@
 /*
  * asa_list.c — re-aggregation of counter arrays and element-wise division.
  *
- * Port of the LIST<FLOAT> aggregate overloads (DuckDB: PacListAggregateState in
- * src/categorical/pac_categorical.cpp) and of priv_div.
+ * Port of the LIST<FLOAT> aggregate overloads (DuckDB: the list aggregate state of its
+ * categorical rewrite) and of priv_div.
  *
  *   as_sum(real[]) / as_count(real[]) / as_min(real[]) / as_max(real[]) -> real[64]
  *     combine per-world counter arrays across rows, e.g. an inner query producing

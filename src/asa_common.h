@@ -2,7 +2,7 @@
  * asa_common.h — shared definitions for the SIMD-ASA PostgreSQL extension.
  *
  * Port of the aggregate engine of the DuckDB `privacy` extension
- * (src/include/aggregates/as_aggregate.hpp): the stochastic aggregates, the PAC noise
+ * (src/include/aggregates/as_aggregate.hpp): the stochastic aggregates, the AS noise
  * release (asa_noise.c) and the query rewrite (asa_rewrite.c). The DP mechanisms are
  * not ported.
  *

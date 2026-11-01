@@ -1,7 +1,7 @@
 /*
  * asa_rewrite.c — automatic SIMD-ASA query rewrite.
  *
- * PostgreSQL counterpart of the DuckDB extension's PAC compiler (FK join injection,
+ * PostgreSQL counterpart of the DuckDB extension's AS compiler (FK join injection,
  * aggregate transformation, categorical and top-k rewrites). With simd_asa.rewrite = on,
  * a query over relations owned by the sampling entity is rewritten during parse analysis,
  * one query level (statement, FROM-clause subquery, CTE, sub-select) at a time:
@@ -14,7 +14,7 @@
  *      derives from does. A row of k distinct entities is thus in a world with probability
  *      2^-k, and the aggregates multiply by the correction 2^(k-1) (DuckDB's correction).
  *   2. Aggregates over dependent rows are released: sum/count/avg/min/max become noised
- *      PAC aggregates (asa_noised_*) of the original result type. An arithmetic expression
+ *      AS aggregates (asa_noised_*) of the original result type. An arithmetic expression
  *      over several aggregates is evaluated per world (asa_lane_*) and released once
  *      (asa_noised); other expressions apply to the released values. count/sum/avg(DISTINCT)
  *      become asa_*_distinct, ordered by their value (asa_distinct.c). With
@@ -737,7 +737,7 @@ typedef enum AsaAggForm
 {
 	ASA_AGG_COUNTERS,			/* as_*(mask [, value]): world counters */
 	ASA_AGG_QCOUNTERS,			/* asa_counters_*(mask [, value], query_hash, correction): the same, ... */
-	ASA_AGG_NOISED				/* ... sharing the transition state of asa_noised_*(...): PAC release */
+	ASA_AGG_NOISED				/* ... sharing the transition state of asa_noised_*(...): AS release */
 } AsaAggForm;
 
 /*
@@ -1320,7 +1320,7 @@ asa_coerce(AsaCtx *ctx, Expr *expr, Oid type, int32 typmod)
 }
 
 /*
- * Top-k pushdown (pac_topk_rewriter.cpp): ORDER BY ... LIMIT over aggregates ranks the groups
+ * Top-k pushdown (DuckDB's top-k rewrite): ORDER BY ... LIMIT over aggregates ranks the groups
  * by the mean of their worlds (priv_mean) and releases only the selected ones. The query
  * becomes
  *
@@ -2096,7 +2096,7 @@ asa_level(AsaStmt *st, Query *query, AsaKind kind, bool consumed, bool consumer_
 	if (query->groupingSets)
 		ASA_UNSUPPORTED("GROUPING SETS, ROLLUP and CUBE are not supported");
 
-	/* rows in no world do not form groups (DuckDB filters pac_pu <> 0) */
+	/* rows in no world do not form groups (DuckDB filters them out too) */
 	if (predicates && grouped)
 		query->jointree->quals = make_and_qual(query->jointree->quals,
 											   (Node *) make_op(ctx.pstate, list_make2(makeString("pg_catalog"),
@@ -2254,7 +2254,7 @@ asa_rewrite_init(void)
 {
 	DefineCustomBoolVariable("simd_asa.rewrite",
 							 "Rewrite queries over the sampling entity into SIMD-ASA aggregates.",
-							 "Aggregates then return PAC-noised values (see simd_asa.noise, simd_asa.counters).",
+							 "Aggregates then return AS-noised values (see simd_asa.noise, simd_asa.counters).",
 							 &asa_rewrite_enabled, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("simd_asa.counters",
 							 "Rewritten aggregates return their 64 world counters (real[]) instead of a release.",
@@ -2264,7 +2264,7 @@ asa_rewrite_init(void)
 	DefineCustomBoolVariable("simd_asa.pushdown_topk",
 							 "ORDER BY ... LIMIT over aggregates ranks groups by the mean of their worlds and "
 							 "releases only the selected ones.",
-							 "pac_pushdown_topk.",
+							 "As in DuckDB.",
 							 &asa_pushdown_topk, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomStringVariable("simd_asa.entity",
 							   "Sampling entity of the rewritten queries (a table declared with asa_add_entity).",

@@ -1,11 +1,11 @@
--- PAC noise release: as_noised_* aggregates, as_noised, priv_filter, priv_mean.
+-- AS noise release: as_noised_* aggregates, as_noised, priv_filter, priv_mean.
 SET extra_float_digits = 0;
 SET max_parallel_workers_per_gather = 0;
 CREATE TABLE nt (k integer, g integer, vi integer, vb bigint, vf float8, vn numeric(10,2));
 INSERT INTO nt SELECT x, x % 3, x % 17 - 5, x * 1000, (x % 11) * 0.25, (x % 23) * 1.25
 FROM generate_series(1, 3000) x;
 -- ---------------------------------------------------------------------------
--- Without noise a release is world 0 of the counters (DuckDB, pac_mi = 0)
+-- Without noise a release is world 0 of the counters (DuckDB with noise off)
 -- ---------------------------------------------------------------------------
 SET simd_asa.noise = off;
 SELECT g,

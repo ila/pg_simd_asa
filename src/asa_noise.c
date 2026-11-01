@@ -1,10 +1,9 @@
 /*
- * asa_noise.c — PAC noise release of world counters.
+ * asa_noise.c — AS noise release of world counters.
  *
- * Port of the PAC terminal layer of the DuckDB extension (src/aggregates/as_aggregate.cpp:
- * PacNoiseInNull, PacNoisySampleFrom64Counters, CheckPacSampleDiversity; src/categorical/
- * pac_categorical.cpp: as_noised, priv_filter; src/query_processing/pac_topk_rewriter.cpp:
- * priv_mean). A release turns the 64 world counters of one cell into one value:
+ * Port of the release functions of the DuckDB extension (src/aggregates/as_aggregate.cpp:
+ * NULL decision, noised sample, sample-diversity check; its categorical rewrite: as_noised,
+ * priv_filter; its top-k rewrite: priv_mean). A release turns the 64 world counters of one cell into one value:
  *
  *   1. NULL decision: with noise, the cell is NULL with probability popcount(~key_hash)/64
  *      (cells few entities contribute to are likely suppressed); without noise, only cells
@@ -15,7 +14,7 @@
  *      posterior over the worlds, updated after every release of the statement, so that
  *      the noise accounts for what earlier cells revealed. Without noise: world 0.
  *
- * simd_asa.noise = off (or simd_asa.mi = 0) is DuckDB's deterministic pac_mi = 0 mode.
+ * simd_asa.noise = off (or simd_asa.mi = 0) is DuckDB's deterministic mode (noise off).
  *
  * Randomness is drawn from a per-statement generator seeded by the query hash, and the
  * p-tracking posterior lives with it. Both are reset when a top-level statement starts
@@ -38,11 +37,11 @@
 #include "utils/regproc.h"
 
 #define ASA_MAGIC_HASH UINT64CONST(2983746509182734091)
-#define ASA_SUSPICIOUS_THRESHOLD 500	/* PAC_SUSPICIOUS_THRESHOLD */
+#define ASA_SUSPICIOUS_THRESHOLD 500	/* DuckDB's threshold */
 #define ASA_QUERY_STATES 8
 
 static bool asa_noise = true;
-static double asa_mi = 1.0 / 128;	/* pac_mi default */
+static double asa_mi = 1.0 / 128;	/* DuckDB's default */
 static bool asa_ptracking = true;
 static bool asa_diversity_check = true;
 
@@ -156,7 +155,7 @@ asa_effective_mi(void)
 }
 
 /*
- * PacNoiseInNull: NULL with probability popcount(~key_hash) / (64 * correction), or
+ * NULL decision: NULL with probability popcount(~key_hash) / (64 * correction), or
  * without noise when no world received a row.
  */
 static bool
@@ -169,7 +168,7 @@ asa_noise_in_null(uint64 key_hash, double mi, double correction, AsaQueryState *
 	return asa_popcount64(~key_hash) > (int) (pg_prng_uint64(&qs->rng) % Max(range, 1));
 }
 
-/* PacNoisySampleFrom64Counters: vals already hold 0 for worlds outside key_hash. */
+/* Noised sample: vals already hold 0 for worlds outside key_hash. */
 static double
 asa_noisy_sample(const double *vals, double mi, uint64 query_hash, AsaQueryState *qs)
 {
@@ -238,7 +237,7 @@ typedef struct AsaDiversity
 } AsaDiversity;
 
 /*
- * CheckPacSampleDiversity: a cell whose mask has 29-35 zero bits and whose worlds all hold
+ * Sample-diversity check: a cell whose mask has 29-35 zero bits and whose worlds all hold
  * the same value looks like a single entity. Statistics accumulate over the cells of one
  * aggregate call (fn_extra of the final function persists across groups).
  */
@@ -447,20 +446,20 @@ void
 asa_noise_init(void)
 {
 	DefineCustomBoolVariable("simd_asa.noise",
-							 "Add PAC noise to released aggregates.",
-							 "Off: deterministic releases (world 0), as DuckDB with pac_mi = 0.",
+							 "Add noise to released aggregates.",
+							 "Off: deterministic releases (world 0), as DuckDB with noise off.",
 							 &asa_noise, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("simd_asa.mi",
-							 "Mutual-information bound of the PAC noise (pac_mi).",
+							 "Noise budget of the releases.",
 							 "Lower values add more noise. 0 disables noise, as simd_asa.noise = off.",
 							 &asa_mi, 1.0 / 128, 0.0, DBL_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("simd_asa.ptracking",
 							 "Calibrate the noise of a statement's releases with a posterior over the worlds.",
-							 "Persistent-secret p-tracking (pac_ptracking).",
+							 "Persistent-secret p-tracking.",
 							 &asa_ptracking, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("simd_asa.sample_diversity_check",
 							 "Reject noised aggregates whose groups mostly hold a single sampling entity.",
-							 "pac_sample_diversity_check.",
+							 "As in DuckDB.",
 							 &asa_diversity_check, true, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	prev_executor_start = ExecutorStart_hook;

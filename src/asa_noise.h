@@ -1,5 +1,5 @@
 /*
- * asa_noise.h — PAC noise release of world counters (asa_noise.c).
+ * asa_noise.h — AS noise release of world counters (asa_noise.c).
  */
 #ifndef ASA_NOISE_H
 #define ASA_NOISE_H
