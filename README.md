@@ -99,7 +99,7 @@ TPC-H SF1, the original query:
 | N | 77624935.00 | 0.05000144882208464801 | 3043852 |
 | R | 37719753.00 | 0.05000940583012705647 | 1478870 |
 
-The 64 answers of `count(*)`, one per world (`SET simd_asa.counters = on`). Each world holds about
+The 64 answers of `count(*)`, one per world, before the release. Each world holds about
 half of the customers; counts and sums are doubled, so every world estimates the full answer:
 
 | l_returnflag | world 1 | world 2 | world 3 | … | world 64 |
@@ -252,9 +252,7 @@ level by level (statement, `FROM`-clause subquery, CTE, sub-select):
    `simd_asa.pushdown_topk`).
 
 Several candidate entities can be declared; `SET simd_asa.entity = 'orders'` selects one (a
-single declared entity is the default). With `simd_asa.counters = on` the rewritten aggregates
-return their 64 answers (`real[]`) instead of a release; queries that need a release (HAVING,
-filters over worlds, aggregating subqueries) are then rejected. Queries over entity-independent
+single declared entity is the default). Queries over entity-independent
 relations, queries without aggregates over the entity and queries that already use this
 extension's functions are left unchanged.
 
@@ -359,7 +357,7 @@ plus DuckDB hash compatibility, NULL/empty/extreme inputs, re-aggregation and pa
 (partial → serialize → combine) aggregation. `test/sql/noise.sql` checks the releases: world 0
 without noise, result types, NULL groups, reproducibility, noise within its expected deviation,
 the sample-diversity check and the filter probabilities. `test/sql/rewrite.sql` checks the
-rewrite with `simd_asa.counters = on` — every rewritten query must return exactly the
+rewrite before the release — every rewritten query must return exactly the
 hand-written `as_*` query's result (entity table, direct link, injected join, reused joins, two
 entities and their correction, `FILTER`, `ORDER BY`, prepared statements, entity selection) —
 and the rejected shapes. `test/sql/release.sql` checks the default releases the same way
