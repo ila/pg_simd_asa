@@ -439,12 +439,20 @@ static ASA_AUTOVECTORIZE inline void
 asa_sum_float_update(AsaSumFloatState *s, uint64 mask, double value)
 {
 	float		v = (float) value;
+	uint32		half[2] = {(uint32) mask, (uint32) (mask >> 32)};
 
 	s->key_hash |= mask;
 	if (likely(mask))
 		s->update_count++;
-	for (int j = 0; j < ASA_LANES; j++)
-		s->totals[j] += v * (float) ((mask >> j) & 1); /* multiply by 0 or 1: no branch */
+
+	/*
+	 * Multiply by 0 or 1: no branch. The mask is shifted in 32-bit halves so the
+	 * loop is 32-bit throughout: older GCC (13 on x86, 14 on ARM) does not
+	 * vectorize a 64-bit shift feeding float lanes.
+	 */
+	for (int h = 0; h < 2; h++)
+		for (int j = 0; j < 32; j++)
+			s->totals[h * 32 + j] += v * (float) (int32) ((half[h] >> j) & 1);
 }
 
 static void
