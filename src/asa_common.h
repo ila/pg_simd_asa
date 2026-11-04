@@ -28,11 +28,10 @@
 /* Output element type: PostgreSQL real (float4), as LIST<FLOAT> in DuckDB. */
 typedef float asa_float;
 
-#define ASA_RESTRICT __restrict__
-
 /*
  * Enable AVX2 code generation for the update kernels on x86 (harmless elsewhere:
- * on ARM the compiler auto-vectorizes with NEON at -O3).
+ * on ARM the compiler auto-vectorizes with NEON at -O3). The per-row transition
+ * functions carry it too, so the kernels inline into them.
  */
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #define ASA_AUTOVECTORIZE __attribute__((target("avx2")))

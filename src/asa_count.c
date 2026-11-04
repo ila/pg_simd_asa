@@ -63,7 +63,7 @@ asa_count_create(MemoryContext ctx)
 	return (AsaCountState *) MemoryContextAllocZero(ctx, sizeof(AsaCountState));
 }
 
-void
+ASA_AUTOVECTORIZE void
 asa_count_update(AsaCountState *s, uint64 mask, MemoryContext ctx)
 {
 	s->key_hash |= mask;
