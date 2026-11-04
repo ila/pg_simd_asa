@@ -211,16 +211,21 @@ asa_sum_cascade(AsaSumIntState *s, int k, MemoryContext ctx)
 
 /* SWAR: adds value (< 2^16) to the 16-bit counter of every world whose mask bit is set. */
 static ASA_AUTOVECTORIZE inline void
-asa_sum_add_swar16(uint64 *ASA_RESTRICT total, uint64 value, uint64 mask)
+asa_sum_add_swar16(uint64 *pg_restrict total, uint64 value, uint64 mask)
 {
 	uint64		packed = (uint64) (uint16) value * ASA_SUM_SWAR_MASK;
 
 	for (int i = 0; i < ASA_SUM_SWAR_ELEMENTS; i++)
 	{
-		uint64		bits = (mask >> i) & ASA_SUM_SWAR_MASK;
-		uint64		expanded = (bits << 16) - bits; /* 0x0001 -> 0xFFFF per lane */
+		/*
+		 * 0x0001 -> 0xFFFF per lane: move the bit to the lane's top (0x8000), then
+		 * 0x8000 | (0x8000 - 1); empty lanes stay 0. Not (bits << 16) - bits: clang
+		 * turns that into bits * 0xFFFF, and NEON has no 64-bit multiply, so the
+		 * loop stayed scalar on ARM.
+		 */
+		uint64		h = ((mask >> i) & ASA_SUM_SWAR_MASK) << 15;
 
-		total[i] += packed & expanded;
+		total[i] += packed & (h | (h - (h >> 15)));
 	}
 }
 
@@ -348,7 +353,7 @@ asa_sum_pair_ensure_neg(AsaSumIntPair *p, MemoryContext ctx)
 	return p->neg;
 }
 
-static inline void
+static ASA_AUTOVECTORIZE inline void
 asa_sum_pair_update(AsaSumIntPair *p, uint64 mask, int64 value, MemoryContext ctx)
 {
 	if (unlikely(!mask))
@@ -612,7 +617,7 @@ asa_avg_output(uint64 key_hash, const double *totals, const AsaCountState *count
 		} \
 	} while (0)
 
-static Datum
+static ASA_AUTOVECTORIZE Datum
 asa_sum_int_trans(FunctionCallInfo fcinfo, int64 value)
 {
 	MemoryContext aggctx = asa_agg_context(fcinfo, "as_sum");
@@ -627,7 +632,7 @@ asa_sum_int_trans(FunctionCallInfo fcinfo, int64 value)
 	PG_RETURN_POINTER(p);
 }
 
-static Datum
+static ASA_AUTOVECTORIZE Datum
 asa_sum_float_trans(FunctionCallInfo fcinfo, double value)
 {
 	MemoryContext aggctx = asa_agg_context(fcinfo, "as_sum");
@@ -658,7 +663,7 @@ ASA_DEFINE_SUM_TRANS(as_sum_numeric_trans, AsaSumFloatState, asa_sum_float_trans
 
 /* as_sum(mask, numeric): DECIMAL-style, the integer kernel on values times 10^scale. */
 PG_FUNCTION_INFO_V1(as_sum_numeric_scaled_trans);
-Datum
+ASA_AUTOVECTORIZE Datum
 as_sum_numeric_scaled_trans(PG_FUNCTION_ARGS)
 {
 	MemoryContext aggctx;
@@ -875,7 +880,7 @@ as_sum_float_deserial(PG_FUNCTION_ARGS)
  * SQL-callable: as_avg (sum state + count state in one aggregate)
  * ------------------------------------------------------------------------- */
 
-static Datum
+static ASA_AUTOVECTORIZE Datum
 asa_avg_int_trans(FunctionCallInfo fcinfo, int64 value)
 {
 	MemoryContext aggctx = asa_agg_context(fcinfo, "as_avg");
@@ -892,7 +897,7 @@ asa_avg_int_trans(FunctionCallInfo fcinfo, int64 value)
 	PG_RETURN_POINTER(s);
 }
 
-static Datum
+static ASA_AUTOVECTORIZE Datum
 asa_avg_float_trans(FunctionCallInfo fcinfo, double value)
 {
 	MemoryContext aggctx = asa_agg_context(fcinfo, "as_avg");
@@ -915,7 +920,7 @@ ASA_DEFINE_SUM_TRANS(as_avg_numeric_trans, AsaAvgFloatState, asa_avg_float_trans
 					 asa_numeric_to_double(PG_GETARG_DATUM(2)))
 
 PG_FUNCTION_INFO_V1(as_avg_numeric_scaled_trans);
-Datum
+ASA_AUTOVECTORIZE Datum
 as_avg_numeric_scaled_trans(PG_FUNCTION_ARGS)
 {
 	MemoryContext aggctx;

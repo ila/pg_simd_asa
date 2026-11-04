@@ -62,7 +62,7 @@
 	\
 	/* Branch-free predicated update of all worlds selected by mask. */ \
 	static ASA_AUTOVECTORIZE inline void \
-	NAME##_update_extremes(T *ASA_RESTRICT extremes, uint64 mask, T value) \
+	NAME##_update_extremes(T *pg_restrict extremes, uint64 mask, T value) \
 	{ \
 		union \
 		{ \
@@ -106,7 +106,7 @@
 	} \
 	\
 	PG_FUNCTION_INFO_V1(NAME##_trans); \
-	Datum \
+	ASA_AUTOVECTORIZE Datum \
 	NAME##_trans(PG_FUNCTION_ARGS) \
 	{ \
 		MemoryContext aggctx = asa_agg_context(fcinfo, #NAME); \
